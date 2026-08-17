@@ -44,3 +44,9 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 // upright. Only meaningful while a GLES hw-render core is active (software
 // cores like fbneo output their own orientation and are untouched).
 void MA_GL_set_rotation(unsigned rotation);
+
+// Re-make the hw-render GL context current (no-op when no GLES hw-render
+// core is active). Call after any frontend activity that may have switched
+// to another GL context (e.g. the SDL_Renderer used by the in-game menu)
+// so the next retro_run executes the core's GL work in the right context.
+void MA_GL_make_current(void);

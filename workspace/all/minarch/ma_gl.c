@@ -490,5 +490,31 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 			dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
 			GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
+	// Leave the read binding on the default framebuffer so the in-game
+	// menu's GFX_GL_screenCapture (glReadPixels) grabs what is actually on
+	// screen (the presented, centered frame) instead of the 1024x1024 render
+	// FBO - reading that would return the 640x480 content anchored at its
+	// bottom-left, i.e. the game shifted left with an empty band on the right.
+	// Safe for flycast: glsm's next STATE_BIND restores the core's FBO
+	// binding (default_framebuffer == ma_gl_fbo) at the start of retro_run.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
 	SDL_GL_SwapWindow(win);
+}
+
+// Re-make our GL context current after any frontend UI activity that may have
+// switched to another context (the SDL_Renderer used by the in-game menu owns
+// a SEPARATE GLES2 context and leaves it current). Without this, the first
+// retro_run after the menu runs flycast's glsm STATE_BIND + RenderFrame with
+// the renderer's context current: its FBO/texture ids then refer to phantom
+// objects in that context, so the frame renders nowhere (frozen frame) and
+// the GLCache/glsm shadow state gets polluted, which surfaces as rendering
+// corruption after closing the menu. The game present path (MA_GL_video_refresh)
+// already makes this context current every frame, so this only matters for the
+// window between Menu_loop and the next retro_run.
+void MA_GL_make_current(void) {
+	if (!hw_render_active) return;
+	SDL_Window *win = PLAT_getGLWindow();
+	SDL_GLContext ctx = PLAT_getGLContext();
+	if (win && ctx) SDL_GL_MakeCurrent(win, ctx);
 }

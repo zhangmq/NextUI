@@ -332,6 +332,12 @@ int main(int argc , char* argv[]) {
 		if (show_menu) {
 			PWR_updateFrequency(PWR_UPDATE_FREQ,1);
 			Menu_loop();
+			// The menu presents via the SDL_Renderer, which owns a separate
+			// GLES2 context and leaves it current. Re-make our hw-render GL
+			// context current so the next retro_run's glsm BIND + core render
+			// execute in the right context (otherwise flycast renders into
+			// phantom objects and its GLCache shadow state gets polluted).
+			MA_GL_make_current();
 			// Process RA async operations while menu is shown
 			RA_idle();
 			PWR_updateFrequency(PWR_UPDATE_FREQ_INGAME,0);
