@@ -37,3 +37,10 @@ void MA_GL_context_destroy(void);
 // Called from the video refresh callback when data == RETRO_HW_FRAME_BUFFER_VALID.
 // Presents the GL framebuffer the core rendered into.
 void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size_t pitch);
+
+// Handles RETRO_ENVIRONMENT_SET_ROTATION (0-3, multiples of 90 degrees).
+// RetroArch convention: the core renders the image already oriented for the
+// given rotation and the frontend must rotate its output to display it
+// upright. Only meaningful while a GLES hw-render core is active (software
+// cores like fbneo output their own orientation and are untouched).
+void MA_GL_set_rotation(unsigned rotation);

@@ -37,10 +37,14 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 	// LOG_info("environment_callback: %i\n", cmd);
 
 	switch(cmd) {
-	// case RETRO_ENVIRONMENT_SET_ROTATION: { /* 1 */
-	// 	LOG_info("RETRO_ENVIRONMENT_SET_ROTATION %i\n", *(int *)data); // core requests frontend to handle rotation
-	// 	break;
-	// }
+	case RETRO_ENVIRONMENT_SET_ROTATION: { /* 1 */
+		int rotation = *(int *)data;
+		// Core requests the frontend to handle rotation (flycast ROT270 games
+		// render unrotated and send SET_ROTATION(1)). Only the GLES hw-render
+		// path uses it; software cores (fbneo) output their own orientation.
+		MA_GL_set_rotation((unsigned)rotation);
+		break;
+	}
 	case RETRO_ENVIRONMENT_GET_OVERSCAN: { /* 2 */
 		bool *out = (bool *)data;
 		if (out)

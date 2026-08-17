@@ -82,6 +82,245 @@ static void ma_gl_destroy_fbo(void) {
 	ma_gl_fbo_valid = false;
 }
 
+// ---------------------------------------------------------------------------
+// Rotation (RETRO_ENVIRONMENT_SET_ROTATION) - RetroArch gl2_renderchain style.
+//
+// flycast libretro renders vertical (ROT270) games UNROTATED into the FBO
+// (640x480 landscape) and asks the frontend to rotate the output 90 degrees
+// (libretro.cpp: "actual framebuffer rotation is done by frontend"). We
+// present the FBO texture with a passthrough quad whose texture coordinates
+// implement the rotation - the display rect is aspect-fit into the device
+// using the ROTATED dimensions, mirroring RA's
+// video_viewport_get_scaled_aspect2 + mvp rotation.
+//
+// Why a quad and not glBlitFramebuffer: glBlitFramebuffer cannot rotate 90
+// degrees. Why a state reset after the quad: flycast's GLES2 renderer keeps
+// its own GL state shadow (glcache, core/rend/gles/glcache.h) that SKIPS real
+// gl calls when the cached value matches the requested one, and glsm's
+// STATE_BIND only resets program/viewport/textures/attribs/FBO - caps and
+// blend/stencil/depth/scissor funcs survive into the next core frame. RA's
+// gl2_frame handles this with explicit per-frame state management
+// (gl2_renderchain_restore_default_state + glDisable(STENCIL_TEST|BLEND) +
+// glBlendFunc/glClearColor); we do the same, tuned to flycast's frame-end
+// state (stencil+blend left enabled so glcache's per-draw Enable() skips are
+// harmless).
+// ---------------------------------------------------------------------------
+
+static unsigned ma_gl_rotation = 0;   // 0-3, from SET_ROTATION (0 = no rotation)
+static GLuint ma_gl_present_prog = 0;
+static GLuint ma_gl_present_vao = 0;
+static GLuint ma_gl_present_vbo = 0;
+
+static const char *ma_gl_present_vs =
+	"#version 300 es\n"
+	"layout(location = 0) in vec2 aPos;\n"
+	"layout(location = 1) in vec2 aTex;\n"
+	"out vec2 vTex;\n"
+	"void main() { vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+
+static const char *ma_gl_present_fs =
+	"#version 300 es\n"
+	"precision mediump float;\n"
+	"in vec2 vTex;\n"
+	"uniform sampler2D uTex;\n"
+	"out vec4 fragColor;\n"
+	"void main() { fragColor = texture(uTex, vTex); }\n";
+
+static GLuint ma_gl_compile_shader(GLenum type, const char *src) {
+	GLuint shader = glCreateShader(type);
+	glShaderSource(shader, 1, &src, NULL);
+	glCompileShader(shader);
+	GLint status = 0;
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+	if (!status) {
+		char log[512];
+		glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+		LOG_error("minarch: present shader compile failed: %s\n", log);
+		glDeleteShader(shader);
+		return 0;
+	}
+	return shader;
+}
+
+// Lazy init of the present quad pipeline (must run with the GL context
+// current - MA_GL_video_refresh guarantees that).
+static bool ma_gl_present_init(void) {
+	GLuint vs = ma_gl_compile_shader(GL_VERTEX_SHADER, ma_gl_present_vs);
+	if (!vs) return false;
+	GLuint fs = ma_gl_compile_shader(GL_FRAGMENT_SHADER, ma_gl_present_fs);
+	if (!fs) { glDeleteShader(vs); return false; }
+
+	ma_gl_present_prog = glCreateProgram();
+	glAttachShader(ma_gl_present_prog, vs);
+	glAttachShader(ma_gl_present_prog, fs);
+	glBindAttribLocation(ma_gl_present_prog, 0, "aPos");
+	glBindAttribLocation(ma_gl_present_prog, 1, "aTex");
+	glLinkProgram(ma_gl_present_prog);
+	glDeleteShader(vs);
+	glDeleteShader(fs);
+
+	GLint status = 0;
+	glGetProgramiv(ma_gl_present_prog, GL_LINK_STATUS, &status);
+	if (!status) {
+		char log[512];
+		glGetProgramInfoLog(ma_gl_present_prog, sizeof(log), NULL, log);
+		LOG_error("minarch: present program link failed: %s\n", log);
+		glDeleteProgram(ma_gl_present_prog);
+		ma_gl_present_prog = 0;
+		return false;
+	}
+
+	// One VAO + one interleaved VBO (x,y,u,v per vertex), re-uploaded each
+	// frame (128 bytes - negligible). Own VAO keeps the attrib setup away
+	// from the core's VAOs.
+	glGenVertexArrays(1, &ma_gl_present_vao);
+	glBindVertexArray(ma_gl_present_vao);
+	glGenBuffers(1, &ma_gl_present_vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+	glEnableVertexAttribArray(1);
+	glBindVertexArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+	LOG_info("minarch: present quad pipeline ready (prog=%u vao=%u vbo=%u)\n",
+		(unsigned)ma_gl_present_prog, (unsigned)ma_gl_present_vao,
+		(unsigned)ma_gl_present_vbo);
+	return true;
+}
+
+// Reset every GL state flycast's glcache tracks to values that make its
+// cache skips harmless for the next core frame. flycast's GLES2 renderer
+// (gles/gldraw.cpp) enables GL_STENCIL_TEST at the start of every draw list
+// and never disables it, and typically ends frames with the translucent list
+// (GL_BLEND enabled, SrcBlend/DstBlend = SRC_ALPHA/ONE_MINUS_SRC_ALPHA is the
+// PVR default), so leaving stencil+blend ENABLED with those funcs means the
+// per-draw Enable()/BlendFunc() cache hits are no-ops that match reality.
+// Everything else is left in the disabled/default state flycast's frame-start
+// code (RenderFrame) re-establishes anyway.
+static void ma_gl_reset_core_state(void) {
+	glEnable(GL_STENCIL_TEST);
+	glEnable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glStencilFunc(GL_ALWAYS, 0, 0);
+	glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+	glStencilMask(0xFF);
+	glDepthFunc(GL_LESS);
+	glDepthMask(GL_TRUE);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glCullFace(GL_BACK);
+	glFrontFace(GL_CCW);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glUseProgram(0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindVertexArray(0);
+	glActiveTexture(GL_TEXTURE0);
+}
+
+// Present the core's FBO centered with the configured rotation via a quad.
+// Texture coordinates implement the rotation (the quad rect itself is always
+// axis-aligned, aspect-fit from the ROTATED dimensions). Verified against
+// RetroArch's gl2 renderchain with flycast (bottom_left_origin=true ->
+// unflipped vertexes/texcoords; mvp = Rz(90*rot) * ortho):
+//   rot 0:  u =  cx*tw,  v =  cy*th
+//   rot 1:  u =  cy*tw,  v = (1-cx)*th   (90 deg counter-clockwise)
+//   rot 2:  u = (1-cx)*tw, v = (1-cy)*th (180)
+//   rot 3:  u = (1-cy)*tw, v =  cx*th    (270 CCW = 90 clockwise)
+// where (cx,cy) is the corner's normalized position on the display rect and
+// (tw,th) = (width,height)/FBO size map only the used region of the fixed
+// 1024x1024 FBO texture (content anchored at its GL bottom-left).
+static void ma_gl_present_quad(unsigned width, unsigned height) {
+	if (!ma_gl_present_prog && !ma_gl_present_init())
+		return;
+
+	// Rotated display dims: for 90/270 degree rotation the image's on-screen
+	// bounding box is (height,width) swapped. ma_gl_rotation is the SET_ROTATION
+	// index (0-3), so odd values mean 90/270 degrees. This matches RetroArch's
+	// viewport aspect handling (it fits the core's reported aspect, which for
+	// flycast rotated games is 0.75 = height/width of the 640x480 frame).
+	unsigned disp_w = width, disp_h = height;
+	if (ma_gl_rotation % 2 == 1) { disp_w = height; disp_h = width; }
+	// Aspect-fit into the device (no upscale, like the blit path), centered.
+	double s = fmin((double)DEVICE_WIDTH / disp_w, (double)DEVICE_HEIGHT / disp_h);
+	if (s > 1.0) s = 1.0;
+	int dst_w = (int)(disp_w * s);
+	int dst_h = (int)(disp_h * s);
+	int dst_x = (DEVICE_WIDTH - dst_w) / 2;
+	int dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+
+	// NDC positions (GL y is bottom-up; screen y is top-down).
+	float cx0 = 2.0f * dst_x / DEVICE_WIDTH - 1.0f;
+	float cx1 = 2.0f * (dst_x + dst_w) / DEVICE_WIDTH - 1.0f;
+	float cy0 = 1.0f - 2.0f * (dst_y + dst_h) / DEVICE_HEIGHT; // bottom
+	float cy1 = 1.0f - 2.0f * dst_y / DEVICE_HEIGHT;           // top
+
+	float tw = (float)width / MA_GL_FBO_MAX_W;
+	float th = (float)height / MA_GL_FBO_MAX_H;
+
+	// Per-vertex (x, y, u, v), triangle strip order BL, BR, TL, TR.
+	float verts[16] = { 0 };
+	switch (ma_gl_rotation % 4) {
+	case 1:
+		verts[0]=cx0; verts[1]=cy0; verts[2]=0;    verts[3]=th;
+		verts[4]=cx1; verts[5]=cy0; verts[6]=0;    verts[7]=0;
+		verts[8]=cx0; verts[9]=cy1; verts[10]=tw;  verts[11]=th;
+		verts[12]=cx1; verts[13]=cy1; verts[14]=tw; verts[15]=0;
+		break;
+	case 2:
+		verts[0]=cx0; verts[1]=cy0; verts[2]=tw;   verts[3]=th;
+		verts[4]=cx1; verts[5]=cy0; verts[6]=0;    verts[7]=th;
+		verts[8]=cx0; verts[9]=cy1; verts[10]=tw;  verts[11]=0;
+		verts[12]=cx1; verts[13]=cy1; verts[14]=0; verts[15]=0;
+		break;
+	case 3:
+		verts[0]=cx0; verts[1]=cy0; verts[2]=tw;   verts[3]=0;
+		verts[4]=cx1; verts[5]=cy0; verts[6]=tw;   verts[7]=th;
+		verts[8]=cx0; verts[9]=cy1; verts[10]=0;   verts[11]=0;
+		verts[12]=cx1; verts[13]=cy1; verts[14]=0; verts[15]=th;
+		break;
+	default: // 0
+		verts[0]=cx0; verts[1]=cy0; verts[2]=0;    verts[3]=0;
+		verts[4]=cx1; verts[5]=cy0; verts[6]=tw;   verts[7]=0;
+		verts[8]=cx0; verts[9]=cy1; verts[10]=0;   verts[11]=th;
+		verts[12]=cx1; verts[13]=cy1; verts[14]=tw; verts[15]=th;
+		break;
+	}
+
+	// Draw the quad with a clean pipeline.
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+
+	glUseProgram(ma_gl_present_prog);
+	glBindVertexArray(ma_gl_present_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+	// Leave the state flycast's glcache expects (see ma_gl_reset_core_state).
+	ma_gl_reset_core_state();
+}
+
+void MA_GL_set_rotation(unsigned rotation) {
+	ma_gl_rotation = rotation % 4;
+	LOG_info("minarch: SET_ROTATION %u -> present rotates %u deg (%s path)\n",
+		rotation, ma_gl_rotation * 90,
+		ma_gl_rotation == 0 ? "blit" : "quad");
+}
+
 // Frame-rate throttle, same scheme as GFX_flip_fixed_rate (api.c): schedule
 // each present at frame_index * 1/fps, usleep the bulk then busy-wait the
 // remainder. This is the libretro convention for frontends without vsync
@@ -219,6 +458,15 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	ma_gl_throttle(core.fps);
 
 	SDL_GL_MakeCurrent(win, ctx);
+
+	if (ma_gl_rotation != 0) {
+		// Vertical/rotated game (flycast ROT270 etc.): the core rendered
+		// unrotated into the FBO and asked us to rotate the output.
+		// RetroArch-style quad present with per-frame state management.
+		ma_gl_present_quad(width, height);
+		SDL_GL_SwapWindow(win);
+		return;
+	}
 
 	// Present the core's FBO centered onto the default framebuffer
 	// (RetroArch: FBO quad; nextui convention: center via (device-src)/2).
