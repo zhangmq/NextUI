@@ -463,6 +463,10 @@ typedef struct {
 void SND_init(double sample_rate, double frame_rate);
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count);
 size_t SND_batchSamples_fixed_rate(const SND_Frame* frames, size_t frame_count);
+// Enable/disable blocking on a full audio ring buffer (hw-render cores:
+// gives an emulator thread audio backpressure like RetroArch's blocking
+// audio write). Software cores keep dropping frames when full.
+void SND_setBlockOnFull(int enable);
 void SND_quit(void);
 void SND_resetAudio(double sample_rate, double frame_rate);
 void SND_pauseAudio(bool paused);
@@ -723,6 +727,9 @@ void PLAT_blitRenderer(GFX_Renderer* renderer);
 void PLAT_flip(SDL_Surface* screen, int sync);
 void PLAT_GL_Swap();
 void GFX_GL_Swap();
+// GL context accessors for the libretro hardware-render (glsm) path
+SDL_Window* PLAT_getGLWindow(void);
+SDL_GLContext PLAT_getGLContext(void);
 unsigned char* PLAT_GL_screenCapture(int* outWidth, int* outHeight);
 void PLAT_setClearColor(uint32_t color);
 void PLAT_GPU_Flip();

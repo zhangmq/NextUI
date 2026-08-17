@@ -7,6 +7,7 @@ CORES+= c128
 CORES+= fake-08
 CORES+= fbneo
 CORES+= fceumm
+CORES+= flycast
 CORES+= gambatte
 CORES+= gpsp
 CORES+= libretro-cap32
@@ -70,6 +71,21 @@ mednafen_supafaust_REPO = https://github.com/libretro/supafaust
 # mGBA replaced Makefile.libretro with a CMake-based libretro build.
 mgba_CORE = build-h700/mgba_libretro.so
 mgba_MAKE = cmake -S . -B build-h700 -DCMAKE_BUILD_TYPE=Release -DLIBMGBA_ONLY=ON -DBUILD_LIBRETRO=ON -DLIBRETRO_STATIC=OFF -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc -DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ -DCMAKE_C_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common -ftree-vectorize -funswitch-loops" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common -ftree-vectorize -funswitch-loops" && cmake --build build-h700 --target mgba_libretro -- $(PROCS)
+
+# Flycast (NAOMI/DC) libretro core.
+# v1.2 (2021-12, "New Libretro core") is the first libretro release and the
+# last one that still builds with C++11 — the project's GCC 8.3 toolchain ICEs
+# on newer (C++17) code. USE_GLES=ON defines HAVE_OPENGLES3 so glsm's GL3
+# entry points (VAO/FBO) are real, not empty stubs (USE_GLES2 leaves them
+# blank -> first-frame crash). The default -lGLESv3 is overridden with
+# -lGLESv2: the sysroot has no libGLESv3, but Mali's libGLESv2 exports the
+# full GLES2+GLES3 set (glGenVertexArrays etc. confirmed via nm).
+# Only libchdr submodule is needed; SDL submodule is unused by the libretro build.
+flycast_REPO = https://github.com/flyinghead/flycast
+flycast_HASH = 7555263e38722ea0e3f2b736b92ad0a91389f4b4
+flycast_CORE = build-h700/flycast_libretro.so
+flycast_SUBMODULES = core/deps/libchdr
+flycast_MAKE = cmake -S . -B build-h700 -DCMAKE_BUILD_TYPE=Release -DLIBRETRO=ON -DUSE_GLES=ON -DUSE_VULKAN=OFF -DCMAKE_SHARED_LINKER_FLAGS="-lGLESv2" -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc -DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ -DCMAKE_C_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" && cmake --build build-h700 --target flycast_libretro -- $(PROCS)
 
 pcsx_rearmed_MAKEFILE = Makefile.libretro
 # pcsx has a disabled submodule for gnulib, which takes forever to check out and is unused - skil checkout

@@ -16,6 +16,7 @@
 #include "ma_video.h"
 #include "ma_core.h"
 #include "ma_game.h"
+#include "ma_gl.h"
 #include "ma_environment.h"
 #include "ma_config.h"
 #include "ma_runframe.h"
@@ -195,6 +196,11 @@ int main(int argc , char* argv[]) {
 	// why not move to Core_init()?
 	Menu_setCoreVersionDesc(core.version);
 	Core_load();
+
+	// GLES hardware-render cores (flycast) negotiate the GL context during
+	// retro_load_game; MA_GL_set_hw_render already ran context_reset inside
+	// the SET_HW_RENDER callback (before load_game returned), so the core's
+	// emu thread has a valid GL context from the start.
 	
 	Input_init(NULL);
 	Config_readOptions(); // but others load and report options later (eg. nes)
@@ -212,11 +218,16 @@ int main(int argc , char* argv[]) {
 	// Pass ROM data if available, otherwise just path (for cores that load from file)
 	{
 		char* rom_path_for_ra = game.tmp_path[0] ? game.tmp_path : game.path;
+		LOG_warn("minarch: diag BEFORE RA_loadGame\n");
 		RA_loadGame(rom_path_for_ra, game.data, game.size, core.tag);
+		LOG_warn("minarch: diag AFTER RA_loadGame\n");
 	}
 	
+	LOG_warn("minarch: diag BEFORE State_resume\n");
 	State_resume();
+	LOG_warn("minarch: diag after State_resume\n");
 	Menu_initState(); // make ready for state shortcuts
+	LOG_warn("minarch: diag after Menu_initState\n");
 
 	PWR_disableAutosleep();
 	// we dont need five second updates while ingame, and wifi status isnt displayed either
@@ -225,14 +236,17 @@ int main(int argc , char* argv[]) {
 	// force a vsync immediately before loop
 	// for better frame pacing?
 	GFX_clearAll();
+	LOG_warn("minarch: diag after GFX_clearAll\n");
 	GFX_clearLayers(0);
 	GFX_clear(screen);
 
 	// need to draw real black background first otherwise u get weird pixels sometimes
 
 	GFX_flip(screen);
+	LOG_warn("minarch: diag after GFX_flip\n");
 
 	Special_init(); // after config
+	LOG_warn("minarch: diag after Special_init\n");
 
 	chooseSyncRef();
 	
@@ -240,15 +254,19 @@ int main(int argc , char* argv[]) {
 
 	// then initialize custom  shaders from settings
 	initShaders();
+	LOG_warn("minarch: diag after initShaders\n");
 	Config_readOptions();
 	applyShaderSettings();
+	LOG_warn("minarch: diag after applyShaderSettings\n");
 	int rewind_initialized = Rewind_init(core.serialize_size ? core.serialize_size() : 0);
+	LOG_warn("minarch: diag after Rewind_init\n");
 	rewind_init_ready = 1;  // Mark setup as attempted, even if rewind init failed, so option changes can retry it later.
 	if (rewind_initialized && core.serialize_size) Rewind_on_state_change();
 	// release config when all is loaded
 	Config_free();
 
 	LOG_info("total startup time %ims\n\n",SDL_GetTicks());
+	LOG_info("minarch: entering main loop, MA_GL_active=%d\n", MA_GL_is_active());
 	
 	// we started in performance mode, now reset to the desired mode
 	// if the config didn't specify the desired cpu speed, the default is 0 = auto
@@ -359,6 +377,9 @@ finish:
 	Game_close();
 	Rewind_free();
 	Core_unload();
+	// GLES hardware-render cores free their GL resources here while the
+	// context is still alive.
+	MA_GL_context_destroy();
 	Core_quit();
 	Core_close();
 	Config_quit();

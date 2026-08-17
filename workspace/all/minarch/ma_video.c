@@ -4,6 +4,7 @@
 #include "ma_internal.h"
 #include "scaler.h"
 #include "ma_video.h"
+#include "ma_gl.h"
 
 
 static const char* bitmap_font[] = {
@@ -936,6 +937,13 @@ static void convert_rgb565_to_rgba(const void* src, uint32_t* dst, unsigned widt
 }
 
 void video_refresh_callback(const void* data, unsigned width, unsigned height, size_t pitch) {
+	// GLES hardware-render path: the core passes RETRO_HW_FRAME_BUFFER_VALID
+	// and the frame lives in the GL framebuffer, not in a pixel buffer.
+	if (MA_GL_is_active()) {
+		MA_GL_video_refresh(data, width, height, pitch);
+		return;
+	}
+
 	// Log NEON availability once on first call
 	static int neon_logged = 0;
 	if (!neon_logged) {

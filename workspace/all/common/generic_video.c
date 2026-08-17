@@ -684,6 +684,15 @@ SDL_Surface* PLAT_initVideo(void) {
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
 	}
 
+	// Hardware-render cores (flycast) need a complete default framebuffer:
+	// they glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT) every frame.
+	// Without depth/stencil the default framebuffer is incomplete on Mali.
+	// Same attributes as standalone flycast's SDLGLGraphicsContext::Init
+	// (DEPTH 24, STENCIL 8, DOUBLEBUFFER). Must be set before CreateContext.
+	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+
 	vid.gl_context = SDL_GL_CreateContext(vid.window);
 	if (!vid.gl_context) {
 		LOG_error("SDL_GL_CreateContext failed: %s\n", SDL_GetError());
@@ -1999,6 +2008,10 @@ int prepareFrameThread(void *data) {
 }
 
 static SDL_Thread *prepare_thread = NULL;
+
+// GL context accessors for the libretro hardware-render (glsm) path
+SDL_Window* PLAT_getGLWindow(void) { return vid.window; }
+SDL_GLContext PLAT_getGLContext(void) { return vid.gl_context; }
 
 void PLAT_GL_Swap() {
 

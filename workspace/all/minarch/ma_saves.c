@@ -206,7 +206,9 @@ int State_read(void) { // from picoarch
 	}
 
 	int success = 0;
+	LOG_warn("minarch: State_read diag1 before serialize_size\n");
 	size_t state_size = core.serialize_size();
+	LOG_warn("minarch: State_read diag2 after serialize_size=%zu\n", state_size);
 	if (!state_size) return 0;
 
 	int was_ff = fast_forward;
@@ -226,7 +228,9 @@ int State_read(void) { // from picoarch
 #ifdef HAS_SRM
 	rzipstream_t *state_rzfile = NULL;
 
+	LOG_warn("minarch: State_read diag3 before rzipstream_open filename=%s\n", filename);
 	state_rzfile = rzipstream_open(filename, RETRO_VFS_FILE_ACCESS_READ);
+	LOG_warn("minarch: State_read diag4 after rzipstream_open=%p\n", (void*)state_rzfile);
 	if(!state_rzfile) {
 	  if (state_slot!=8) { // st8 is a default state in MiniUI and may not exist, that's okay
 		LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
@@ -252,10 +256,12 @@ int State_read(void) { // from picoarch
 	  goto error;
 	}
 
+	LOG_warn("minarch: State_read diag5 before core.unserialize\n");
 	if (!core.unserialize(state, state_size)) {
 	  LOG_error("Error restoring save state: %s\n", filename);
 	  goto error;
 	}
+	LOG_warn("minarch: State_read diag6 after core.unserialize\n");
 	success = 1;
 
 error:

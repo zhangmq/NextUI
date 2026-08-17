@@ -210,6 +210,11 @@ static struct SND_Context
 	int frame_out;	  // buf_r
 	int frame_filled; // max_buf_w
 
+	// When set, SND_batchSamples blocks (cond_wait) on a full ring buffer
+	// instead of dropping frames. Used by the hardware-render path to give
+	// an emulator thread (flycast ThreadedRendering) audio backpressure.
+	int block_on_full;
+
 	int device_id; // SDL device id
 } snd = {0};
 
@@ -2688,6 +2693,11 @@ SDL_Color GFX_mapColor(uint32_t c)
 #define ms SDL_GetTicks
 
 pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Signalled by the SDL audio callback after it drains frames, so a producer
+// can block on a full ring buffer (audio backpressure, like RetroArch's
+// blocking audio write). Only used by the hw-render path (SND_batchSamples
+// with snd.block_on_full); software cores never wait.
+static pthread_cond_t audio_cond = PTHREAD_COND_INITIALIZER;
 
 static void SND_audioCallback(void *userdata, uint8_t *stream, int len)
 {
@@ -2709,6 +2719,7 @@ static void SND_audioCallback(void *userdata, uint8_t *stream, int len)
 		if (snd.frame_out >= snd.frame_count)
 			snd.frame_out = 0;
 	}
+	pthread_cond_broadcast(&audio_cond);
 	pthread_mutex_unlock(&audio_mutex);
 
 	if (len > 0)
@@ -2956,7 +2967,9 @@ size_t SND_batchSamples(const SND_Frame *frames, size_t frame_count)
 	perf.buffer_free = remaining_space;
 
 	// let audio buffer fill a little first and then unpause audio so no underruns occur
-	if (perf.buffer_free < snd.frame_count * 0.6f) {
+	// NOTE: with block_on_full (hw-render path) the audio device must keep
+	// draining or producers would block forever on a full buffer.
+	if (snd.block_on_full || perf.buffer_free < snd.frame_count * 0.6f) {
 		SND_pauseAudio(false);
 	} else if (perf.buffer_free > snd.frame_count * 0.99f) { // if for some reason buffer drops below threshold again, pause it (like psx core can stop sending audio in between scenes or after fast forward etc)
 		SND_pauseAudio(true);
@@ -3024,11 +3037,21 @@ size_t SND_batchSamples(const SND_Frame *frames, size_t frame_count)
 		for (int i = 0; i < resampled.frame_count; i++)
 		{
 			// Check if buffer full (leave one slot free)
-			if ((snd.frame_in + 1) % snd.frame_count == snd.frame_out)
+			while ((snd.frame_in + 1) % snd.frame_count == snd.frame_out)
 			{
-				// Buffer full, break early
-				break;
+				if (!snd.block_on_full)
+					break; // drop: non-hw-render path keeps old behavior
+				// Backpressure: wait for the SDL audio callback to drain.
+				// Timeout guards against a dead audio device (e.g. sink
+				// switch); with no consumer the producer just ticks slowly.
+				struct timespec ts;
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_nsec += 20 * 1000000;
+				if (ts.tv_nsec >= 1000000000) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000; }
+				pthread_cond_timedwait(&audio_cond, &audio_mutex, &ts);
 			}
+			if ((snd.frame_in + 1) % snd.frame_count == snd.frame_out)
+				break;
 			snd.buffer[snd.frame_in] = resampled.frames[i];
 			snd.frame_in = (snd.frame_in + 1) % snd.frame_count;
 			written_frames++;
@@ -3288,6 +3311,13 @@ void SND_pauseAudio(bool paused)
 #else
 	SDL_PauseAudio(paused);
 #endif
+}
+
+void SND_setBlockOnFull(int enable)
+{
+	pthread_mutex_lock(&audio_mutex);
+	snd.block_on_full = enable ? 1 : 0;
+	pthread_mutex_unlock(&audio_mutex);
 }
 
 FALLBACK_IMPLEMENTATION void PLAT_audioDeviceWatchRegister(void (*cb)(int, int)) {}
