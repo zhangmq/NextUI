@@ -8,6 +8,12 @@
 #include "ma_internal.h"
 #include "ma_gl.h"
 
+// Screen X/Y raw offsets (Frontend menu): defined in generic_video.c as
+// screenx = x - 64 / screeny = y - 64 (range -64..64 px). No header
+// declaration exists - extern here for the present-rect computation.
+extern int screenx;
+extern int screeny;
+
 // The libretro hardware-render callback as negotiated with the core.
 // get_proc_address / get_current_framebuffer are owned by the frontend;
 // context_reset / context_destroy are provided by the core.
@@ -222,6 +228,137 @@ static void ma_gl_reset_core_state(void) {
 	glActiveTexture(GL_TEXTURE0);
 }
 
+// ---------------------------------------------------------------------------
+// Frontend Screen Scaling -> target-side viewport (RetroArch GLES model).
+//
+// PORTING FIDELITY: RetroArch's GLES driver computes the destination with a
+// pure target-side viewport model -- the keep-aspect/stretch branches of
+// gl2_set_viewport (gfx/drivers/gl.c, ra-ref/gl19.c:384-478) plus
+// video_viewport_get_scaled_integer for the integer branch (video_driver.c,
+// ra-ref/retroarch19.c:32567-32639) -- and never touches the SOURCE rect:
+// the whole core frame is mapped into the computed screen rect. Frontend
+// mode mapping onto that model:
+//   NATIVE        -> video_scale_integer: integer scale of the core base
+//                    geometry, centered.
+//   ASPECT        -> keep_aspect, desired = core.aspect_ratio (RA "Core
+//                    provided", retroarch19.c:32111-32125).
+//   ASPECT_SCREEN -> keep_aspect, desired = source (display) frame ratio.
+//   FULLSCREEN    -> !keep_aspect: stretch to the whole screen (gl19.c:452).
+//   CROPPED       -> video_scale_integer with CEILING scale: the same RA
+//                    Integer Scale option as NATIVE (retroarch19.c:32567),
+//                    only the stepping direction differs -- ceiling covers
+//                    the screen and the symmetric overflow is clipped by the
+//                    viewport. HDMI falls back to NATIVE (minarch rule,
+//                    ma_video.c:451).
+// We do NOT call the software functions (setRectToAspectRatio dereferences
+// the software-only vid.blit state machine); the viewport math below is
+// taken verbatim from the RA GLES viewport code referenced above.
+//
+// width/height: the frame's DISPLAY geometry -- for rotated games pass the
+// width/height-swapped dims (quad path), mirroring RA's rotation handling.
+// The result is the screen-space rect (it may extend past the screen; the
+// viewport clips the overflow), with the minarch-specific Screen X/Y
+// offsets applied (software setRectToAspectRatio adds them in every branch,
+// generic_video.c:1608/1628/1633).
+// ---------------------------------------------------------------------------
+static void ma_gl_compute_present_rect(int width, int height,
+		int *out_x, int *out_y, int *out_w, int *out_h) {
+	int scaling = screen_scaling;
+	if (scaling == SCALE_CROPPED && DEVICE_WIDTH == HDMI_WIDTH)
+		scaling = SCALE_NATIVE; // minarch rule: no crop on HDMI
+
+	int dst_x = 0, dst_y = 0, dst_w = DEVICE_WIDTH, dst_h = DEVICE_HEIGHT;
+	float device_aspect = (float)DEVICE_WIDTH / DEVICE_HEIGHT;
+	double desired = (scaling == SCALE_ASPECT_SCREEN)
+		? (double)width / height
+		: (core.aspect_ratio > 0 ? core.aspect_ratio : (double)width / height);
+
+	if (scaling == SCALE_NATIVE || scaling == SCALE_CROPPED)
+	{
+		// video_viewport_get_scaled_integer (retroarch19.c:32567): integer
+		// scale of the core base geometry. minarch does not cache
+		// base_width/base_height, but flycast's reported base (640x480)
+		// equals the presented frame and the software scaler uses the frame
+		// size as its integer base too, so base == frame here. base_w is the
+		// square-pixel correction base_h * aspect (retroarch19.c:32610;
+		// aspect == core-reported ratio, which for flycast matches the frame;
+		// for rotated games the passed dims are already swapped, so the base
+		// follows the rotation the way RA swaps base_height, :32598).
+		unsigned base_h = (height > 0) ? height : 1;
+		unsigned base_w = (unsigned)roundf(base_h * (float)desired);
+		if (DEVICE_WIDTH >= (int)base_w && DEVICE_HEIGHT >= (int)base_h)
+		{
+			unsigned max_scale = MIN(DEVICE_WIDTH / (int)base_w,
+					DEVICE_HEIGHT / (int)base_h);
+			if (scaling == SCALE_CROPPED)
+				// Ceiling variant of RA's integer scale (video_scale_integer):
+				// cover the screen; the overflow is clipped by the viewport
+				// when rendering.
+				max_scale = MIN(CEIL_DIV(DEVICE_WIDTH, (int)base_w),
+						CEIL_DIV(DEVICE_HEIGHT, (int)base_h));
+			dst_w = (int)(base_w * max_scale);
+			dst_h = (int)(base_h * max_scale);
+			// Centered (RA: vp->x = padding_x / 2, retroarch19.c:32637).
+			dst_x = (DEVICE_WIDTH - dst_w) / 2;
+			dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+		}
+		else
+		{
+			// Source larger than the screen: the software path keeps it 1:1
+			// and lets the screen crop it ("forced crop"); the viewport clips
+			// the overflow here the same way.
+			dst_w = width;
+			dst_h = height;
+			dst_x = (DEVICE_WIDTH - dst_w) / 2;
+			dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+		}
+	}
+	else if (scaling == SCALE_FULLSCREEN)
+	{
+		// gl2_set_viewport, !keep_aspect branch (gl19.c:452-457): stretch to
+		// the whole screen.
+		dst_x = 0;
+		dst_y = 0;
+		dst_w = DEVICE_WIDTH;
+		dst_h = DEVICE_HEIGHT;
+	}
+	else // SCALE_ASPECT / SCALE_ASPECT_SCREEN: gl2_set_viewport keep_aspect
+	{
+		float delta;
+		if (fabsf(device_aspect - (float)desired) < 0.0001f)
+		{
+			/* Screen and desired aspect ratios are numerically equal
+			 * (gl19.c:426-432): full screen. */
+		}
+		else if (device_aspect > (float)desired)
+		{
+			/* Screen wider than desired -> pillarbox (gl19.c:433-437). */
+			delta = ((float)desired / device_aspect - 1.0f) / 2.0f + 0.5f;
+			dst_x = (int)roundf(DEVICE_WIDTH * (0.5f - delta));
+			dst_w = (int)roundf(2.0f * DEVICE_WIDTH * delta);
+		}
+		else
+		{
+			/* Screen taller than desired -> letterbox (gl19.c:439-443). */
+			delta = (device_aspect / (float)desired - 1.0f) / 2.0f + 0.5f;
+			dst_y = (int)roundf(DEVICE_HEIGHT * (0.5f - delta));
+			dst_h = (int)roundf(2.0f * DEVICE_HEIGHT * delta);
+		}
+	}
+
+	// Screen X/Y offsets (frontend-specific, no RA equivalent): the software
+	// path adds them to the centered rect in the aspect==0 and aspect>0
+	// branches of setRectToAspectRatio, and uses them as the rect origin in
+	// the stretch branch -- a plain addition in every case.
+	dst_x += screenx;
+	dst_y += screeny;
+
+	*out_x = dst_x;
+	*out_y = dst_y;
+	*out_w = dst_w;
+	*out_h = dst_h;
+}
+
 // Present the core's FBO centered with the configured rotation via a quad.
 // Texture coordinates implement the rotation (the quad rect itself is always
 // axis-aligned, aspect-fit from the ROTATED dimensions). Verified against
@@ -245,13 +382,13 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// flycast rotated games is 0.75 = height/width of the 640x480 frame).
 	unsigned disp_w = width, disp_h = height;
 	if (ma_gl_rotation % 2 == 1) { disp_w = height; disp_h = width; }
-	// Aspect-fit into the device (no upscale, like the blit path), centered.
-	double s = fmin((double)DEVICE_WIDTH / disp_w, (double)DEVICE_HEIGHT / disp_h);
-	if (s > 1.0) s = 1.0;
-	int dst_w = (int)(disp_w * s);
-	int dst_h = (int)(disp_h * s);
-	int dst_x = (DEVICE_WIDTH - dst_w) / 2;
-	int dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+	// Screen Scaling (Frontend menu) applies to the ROTATED geometry, same
+	// target-side viewport model as the blit path (RA GLES). The rect may
+	// extend past the screen (NATIVE upscales/CROPPED covers) - the viewport
+	// clips it; upscaling a rotated frame is filtered by the texture sampler.
+	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
+	ma_gl_compute_present_rect((int)disp_w, (int)disp_h,
+			&dst_x, &dst_y, &dst_w, &dst_h);
 
 	// NDC positions (GL y is bottom-up; screen y is top-down).
 	float cx0 = 2.0f * dst_x / DEVICE_WIDTH - 1.0f;
@@ -468,24 +605,22 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		return;
 	}
 
-	// Present the core's FBO centered onto the default framebuffer
-	// (RetroArch: FBO quad; nextui convention: center via (device-src)/2).
+	// Frontend Screen Scaling -> target-side viewport (RA GLES model, see
+	// ma_gl_compute_present_rect for the math and mode mapping). The whole
+	// source frame is blitted into the computed screen rect below.
+	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
+	ma_gl_compute_present_rect((int)width, (int)height,
+			&dst_x, &dst_y, &dst_w, &dst_h);
+
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	int dst_w = (int)width;
-	int dst_h = (int)height;
-	if (dst_w > DEVICE_WIDTH || dst_h > DEVICE_HEIGHT) {
-		double s = fmin((double)DEVICE_WIDTH / dst_w, (double)DEVICE_HEIGHT / dst_h);
-		dst_w = (int)(dst_w * s);
-		dst_h = (int)(dst_h * s);
-	}
-	int dst_x = (DEVICE_WIDTH - dst_w) / 2;
-	int dst_y = (DEVICE_HEIGHT - dst_h) / 2;
-
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, ma_gl_fbo);
+	// Blit the WHOLE source frame into the computed screen rect (RA never
+	// changes source coordinates); parts of the rect past the screen are
+	// clipped by the viewport (CROPPED cover / forced crop).
 	glBlitFramebuffer(0, 0, (int)width, (int)height,
 			dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
 			GL_COLOR_BUFFER_BIT, GL_LINEAR);
