@@ -455,6 +455,26 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 			cb->context_type);
 		return false;
 	}
+	// RETRO_ENVIRONMENT_SET_SAVE_STATE_IN_BACKGROUND (0x800002, RetroArch block)
+	// Core (flycast) tells the frontend whether it supports saving states on a
+	// background thread. minarch always serializes synchronously from the menu
+	// (Menu_saveState -> State_write on the main thread), so the "false"
+	// contract (no background saving) matches our behavior exactly. Acknowledge
+	// (return true) so the core does not assume a background-thread capable
+	// frontend; the value in *out belongs to the core, leave it untouched.
+	case 0x800002: {
+		LOG_info("minarch: SET_SAVE_STATE_IN_BACKGROUND acknowledged (synchronous saves only)\n");
+		return true;
+	}
+	// RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE (0x800004, RetroArch block)
+	// Core asks the frontend to poll input early (before the frame). minarch
+	// polls input via PAD_poll in its own main loop and forwards it to the
+	// core's poll_cb during retro_run, so the early/late scheduling distinction
+	// does not apply. Acknowledge the request; *out belongs to the core.
+	case 0x800004: {
+		LOG_info("minarch: POLL_TYPE_OVERRIDE acknowledged\n");
+		return true;
+	}
 	default:
 		// LOG_debug("Unsupported environment cmd: %u\n", cmd);
 		return false;

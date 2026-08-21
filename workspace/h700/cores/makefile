@@ -82,10 +82,10 @@ mgba_MAKE = cmake -S . -B build-h700 -DCMAKE_BUILD_TYPE=Release -DLIBMGBA_ONLY=O
 # full GLES2+GLES3 set (glGenVertexArrays etc. confirmed via nm).
 # Only libchdr submodule is needed; SDL submodule is unused by the libretro build.
 flycast_REPO = https://github.com/flyinghead/flycast
-flycast_HASH = 7555263e38722ea0e3f2b736b92ad0a91389f4b4
+flycast_HASH = 565f5174f72e6012739b240d45cf187bdfbd6aa2
 flycast_CORE = build-h700/flycast_libretro.so
 flycast_SUBMODULES = core/deps/libchdr
-flycast_MAKE = cmake -S . -B build-h700 -DCMAKE_BUILD_TYPE=Release -DLIBRETRO=ON -DUSE_GLES=ON -DUSE_VULKAN=OFF -DCMAKE_SHARED_LINKER_FLAGS="-lGLESv2" -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc -DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ -DCMAKE_C_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" && cmake --build build-h700 --target flycast_libretro -- $(PROCS)
+flycast_MAKE = cmake -S . -B build-h700 -DCMAKE_BUILD_TYPE=Release -DLIBRETRO=ON -DUSE_GLES=ON -DUSE_VULKAN=OFF -DUSE_LUA=OFF -DCMAKE_SHARED_LINKER_FLAGS="-lGLESv2" -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc -DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ -DCMAKE_C_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" && cmake --build build-h700 --target flycast_libretro -- $(PROCS)
 
 pcsx_rearmed_MAKEFILE = Makefile.libretro
 # pcsx has a disabled submodule for gnulib, which takes forever to check out and is unused - skil checkout
