@@ -1,26 +1,45 @@
 diff --git a/shell/libretro/libretro.cpp b/shell/libretro/libretro.cpp
 --- a/shell/libretro/libretro.cpp
 +++ b/shell/libretro/libretro.cpp
-@@ -1754,17 +1754,11 @@
+@@ -1754,11 +1754,23 @@
  
  static bool wait_until_dc_running()
  {
--	retro_time_t start_time = perf_cb.get_time_usec();
--	const retro_time_t FIVE_SECONDS = 5*1000000 ;
--	while(!dc_is_running())
--	{
--		if ( start_time+FIVE_SECONDS < perf_cb.get_time_usec() )
--		{
--			//timeout elapsed - dc not getting a chance to run - just bail
--			return false ;
--		}
--	}
--	return true ;
-+	// minarch h700: bail out immediately if the emulator thread has not
-+	// started (frontend serialize before first retro_run, auto-resume).
-+	if (!dc_is_running())
++	// minarch h700: on startup (State_resume, before the first
++	// retro_run) the emulator thread has never been started. Bail
++	// out immediately - spinning is pointless (the thread only
++	// starts on the first retro_run) and dc_stop() would call a
++	// null sh4_cpu function pointer (crash).
++	if (first_run)
 +		return false;
-+	return true;
++	// Mid-game: the emulator thread is running, but a preceding
++	// retro_serialize_size() dc_resume() restarted it asynchronously,
++	// so it may not be inside its run loop yet (bCpuRun still false).
++	// Wait briefly instead of the original 5s spin or an immediate
++	// false positive that races the restart.
+ 	retro_time_t start_time = perf_cb.get_time_usec();
+-	const retro_time_t FIVE_SECONDS = 5*1000000 ;
++	const retro_time_t RACE_WINDOW = 1000000;  // 1s
+ 	while(!dc_is_running())
+ 	{
+-		if ( start_time+FIVE_SECONDS < perf_cb.get_time_usec() )
++		if ( start_time+RACE_WINDOW < perf_cb.get_time_usec() )
+ 		{
+ 			//timeout elapsed - dc not getting a chance to run - just bail
+ 			return false ;
+ 		}
+ 	}
+ 	return true ;
  }
- 
- size_t retro_serialize_size()
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -94,7 +94,7 @@
+     target_compile_definitions(${PROJECT_NAME} PRIVATE LIBRETRO)
+     if(ANDROID OR USE_GLES)
+ 		target_compile_definitions(${PROJECT_NAME} PRIVATE GLES GLES3 HAVE_OPENGLES HAVE_OPENGLES3)
+-		target_link_libraries(${PROJECT_NAME} PRIVATE "-lGLESv3")
++		target_link_libraries(${PROJECT_NAME} PRIVATE "-lGLESv2")
+     elseif(USE_GLES2)
+ 		target_compile_definitions(${PROJECT_NAME} PRIVATE GLES GLES2 HAVE_OPENGLES HAVE_OPENGLES2)
+ 		target_link_libraries(${PROJECT_NAME} PRIVATE "-lGLESv2")

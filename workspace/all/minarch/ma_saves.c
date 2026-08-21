@@ -316,7 +316,9 @@ int State_write(void) { // from picoarch
 	}
 
 	int success = 0;
+	LOG_warn("minarch: State_write diag1 before serialize_size\n");
 	size_t state_size = core.serialize_size();
+	LOG_warn("minarch: State_write diag2 after serialize_size=%zu\n", state_size);
 	if (!state_size) return 0;
 
 	int was_ff = fast_forward;
@@ -328,7 +330,10 @@ int State_write(void) { // from picoarch
 		goto error;
 	}
 
-	if (!core.serialize(state, state_size)) {
+	LOG_warn("minarch: State_write diag3 before core.serialize\n");
+	bool serialize_ok = core.serialize(state, state_size);
+	LOG_warn("minarch: State_write diag4 after core.serialize=%d\n", serialize_ok);
+	if (!serialize_ok) {
 		LOG_error("Error serializing save state\n");
 		goto error;
 	}
