@@ -257,9 +257,11 @@ static void ma_gl_reset_core_state(void) {
 // width/height: the frame's DISPLAY geometry -- for rotated games pass the
 // width/height-swapped dims (quad path), mirroring RA's rotation handling.
 // The result is the screen-space rect (it may extend past the screen; the
-// viewport clips the overflow), with the minarch-specific Screen X/Y
-// offsets applied (software setRectToAspectRatio adds them in every branch,
-// generic_video.c:1608/1628/1633).
+// viewport clips the overflow). The minarch-specific Screen X/Y offsets are
+// NOT part of this rect: callers apply them to the screen-space rect,
+// identically for the blit and quad paths (see MA_GL_video_refresh and
+// ma_gl_present_quad), keeping the offset directions consistent between
+// landscape and rotated games.
 // ---------------------------------------------------------------------------
 static void ma_gl_compute_present_rect(int width, int height,
 		int *out_x, int *out_y, int *out_w, int *out_h) {
@@ -346,12 +348,10 @@ static void ma_gl_compute_present_rect(int width, int height,
 		}
 	}
 
-	// Screen X/Y offsets (frontend-specific, no RA equivalent): the software
-	// path adds them to the centered rect in the aspect==0 and aspect>0
-	// branches of setRectToAspectRatio, and uses them as the rect origin in
-	// the stretch branch -- a plain addition in every case.
-	dst_x += screenx;
-	dst_y += screeny;
+	// Screen X/Y offsets are NOT applied here: they are frontend-specific
+	// (no RA equivalent) and applied by the callers to the SCREEN-space rect
+	// (see MA_GL_video_refresh and ma_gl_present_quad) with the y sign
+	// adjusted per path so +screeny moves the picture up everywhere.
 
 	*out_x = dst_x;
 	*out_y = dst_y;
@@ -389,6 +389,18 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
 	ma_gl_compute_present_rect((int)disp_w, (int)disp_h,
 			&dst_x, &dst_y, &dst_w, &dst_h);
+	// Screen X/Y offsets (frontend-specific, no RA equivalent): applied to
+	// the SCREEN-space rect, identically for the blit (landscape) and quad
+	// (rotated) paths. NOTE the y sign: the blit path hands dst_y straight to
+	// glBlitFramebuffer (GL window coords, y up) so +screeny moves the
+	// picture up; the quad path converts dst_y through NDC (cy = 1 - 2y/H,
+	// treating dst_y as screen-y-down) which flips the direction, so the
+	// offset must be subtracted there to keep +screeny up on both paths --
+	// matching the software path's +y-up behavior. The offsets must NOT be
+	// applied in the pre-rotation (content) space: that swaps x/y on
+	// rotated games.
+	dst_x += screenx;
+	dst_y -= screeny;
 
 	// NDC positions (GL y is bottom-up; screen y is top-down).
 	float cx0 = 2.0f * dst_x / DEVICE_WIDTH - 1.0f;
@@ -611,6 +623,12 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
 	ma_gl_compute_present_rect((int)width, (int)height,
 			&dst_x, &dst_y, &dst_w, &dst_h);
+	// Screen X/Y offsets (frontend-specific): blit hands dst_y straight to
+	// glBlitFramebuffer (GL window coords, y up), so +screeny moves the
+	// picture up -- same +y-up behavior as the software path. (The quad
+	// path subtracts instead: its NDC conversion flips the y direction.)
+	dst_x += screenx;
+	dst_y += screeny;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
