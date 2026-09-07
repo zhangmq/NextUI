@@ -3,7 +3,7 @@
 #include <math.h>
 #include <unistd.h>
 
-#include <GLES3/gl3.h> // FBO / glBlitFramebuffer (GLES3; Mali libGLESv2 exports them)
+#include <GLES3/gl3.h> // FBO + VAO (GLES3; Mali libGLESv2 exports them)
 
 #include "ma_internal.h"
 #include "ma_gl.h"
@@ -27,9 +27,10 @@ static struct retro_hw_render_callback hw_render;
 static bool hw_render_active = false;
 
 // Frontend hw-render FBO. The core renders into this (glsm caches the id
-// returned by get_current_framebuffer at context reset), and we blit it
-// centered onto the default framebuffer at present time -- the RetroArch
-// convention (core draws into the frontend FBO, frontend presents it).
+// returned by get_current_framebuffer at context reset), and we present it
+// centered onto the default framebuffer with a textured quad -- the
+// RetroArch convention (core draws into the frontend FBO, frontend
+// presents it).
 // Fixed max size so the id never changes after context reset.
 #define MA_GL_FBO_MAX_W 1024
 #define MA_GL_FBO_MAX_H 1024
@@ -105,8 +106,11 @@ static void ma_gl_destroy_fbo(void) {
 // using the ROTATED dimensions, mirroring RA's
 // video_viewport_get_scaled_aspect2 + mvp rotation.
 //
-// Why a quad and not glBlitFramebuffer: glBlitFramebuffer cannot rotate 90
-// degrees. Why a state reset after the quad: flycast's GLES2 renderer keeps
+// Why a quad for everything: glBlitFramebuffer cannot rotate 90 degrees,
+// and its scaling filter kernel is implementation-defined while a sampler
+// is spec-defined - one quad path keeps rotation, filtering, offsets and
+// state management in a single place. Why a state reset after the quad:
+// flycast's GLES2 renderer keeps
 // its own GL state shadow (glcache, core/rend/gles/glcache.h) that SKIPS real
 // gl calls when the cached value matches the requested one, and glsm's
 // STATE_BIND only resets program/viewport/textures/attribs/FBO - caps and
@@ -264,10 +268,8 @@ static void ma_gl_reset_core_state(void) {
 // width/height-swapped dims (quad path), mirroring RA's rotation handling.
 // The result is the screen-space rect (it may extend past the screen; the
 // viewport clips the overflow). The minarch-specific Screen X/Y offsets are
-// NOT part of this rect: callers apply them to the screen-space rect,
-// identically for the blit and quad paths (see MA_GL_video_refresh and
-// ma_gl_present_quad), keeping the offset directions consistent between
-// landscape and rotated games.
+// NOT part of this rect: the present path applies them to the screen-space
+// rect (see ma_gl_present_quad).
 // ---------------------------------------------------------------------------
 static void ma_gl_compute_present_rect(int width, int height,
 		int *out_x, int *out_y, int *out_w, int *out_h) {
@@ -355,9 +357,9 @@ static void ma_gl_compute_present_rect(int width, int height,
 	}
 
 	// Screen X/Y offsets are NOT applied here: they are frontend-specific
-	// (no RA equivalent) and applied by the callers to the SCREEN-space rect
-	// (see MA_GL_video_refresh and ma_gl_present_quad) with the y sign
-	// adjusted per path so +screeny moves the picture up everywhere.
+	// (no RA equivalent) and applied by the single present caller
+	// (ma_gl_present_quad) to the SCREEN-space rect, with the y sign
+	// adjusted for its NDC conversion so +screeny moves the picture up.
 
 	*out_x = dst_x;
 	*out_y = dst_y;
@@ -377,6 +379,14 @@ static void ma_gl_compute_present_rect(int width, int height,
 // where (cx,cy) is the corner's normalized position on the display rect and
 // (tw,th) = (width,height)/FBO size map only the used region of the fixed
 // 1024x1024 FBO texture (content anchored at its GL bottom-left).
+//
+// This is the ONLY present path (landscape included). Rotation is the
+// original reason a quad exists (glBlitFramebuffer cannot rotate 90 deg);
+// folding landscape in unifies the rest: the sampler filter is the
+// spec-defined texture filter (a scaling blit's LINEAR kernel is
+// implementation-defined), and sharpness, offsets and core-state reset
+// apply in one place. Performance is equivalent: a scaling blit on Mali is
+// internally a sampling draw, same as this quad.
 static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (!ma_gl_present_prog && !ma_gl_present_init())
 		return;
@@ -388,23 +398,21 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// flycast rotated games is 0.75 = height/width of the 640x480 frame).
 	unsigned disp_w = width, disp_h = height;
 	if (ma_gl_rotation % 2 == 1) { disp_w = height; disp_h = width; }
-	// Screen Scaling (Frontend menu) applies to the ROTATED geometry, same
-	// target-side viewport model as the blit path (RA GLES). The rect may
+	// Screen Scaling (Frontend menu) applies to the ROTATED geometry, via
+	// the shared target-side viewport model (RA GLES, see
+	// ma_gl_compute_present_rect). The rect may
 	// extend past the screen (NATIVE upscales/CROPPED covers) - the viewport
 	// clips it; upscaling a rotated frame is filtered by the texture sampler.
 	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
 	ma_gl_compute_present_rect((int)disp_w, (int)disp_h,
 			&dst_x, &dst_y, &dst_w, &dst_h);
 	// Screen X/Y offsets (frontend-specific, no RA equivalent): applied to
-	// the SCREEN-space rect, identically for the blit (landscape) and quad
-	// (rotated) paths. NOTE the y sign: the blit path hands dst_y straight to
-	// glBlitFramebuffer (GL window coords, y up) so +screeny moves the
-	// picture up; the quad path converts dst_y through NDC (cy = 1 - 2y/H,
-	// treating dst_y as screen-y-down) which flips the direction, so the
-	// offset must be subtracted there to keep +screeny up on both paths --
-	// matching the software path's +y-up behavior. The offsets must NOT be
-	// applied in the pre-rotation (content) space: that swaps x/y on
-	// rotated games.
+	// the SCREEN-space rect. NOTE the y sign: dst_y goes through the NDC
+	// conversion below (cy = 1 - 2y/H, which treats dst_y as screen-y-down
+	// and flips it), so the offset must be SUBTRACTED here for +screeny to
+	// move the picture up on screen -- matching the software path's +y-up
+	// behavior for every orientation. The offsets must NOT be applied in
+	// the pre-rotation (content) space: that swaps x/y on rotated games.
 	dst_x += screenx;
 	dst_y -= screeny;
 
@@ -446,7 +454,14 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		break;
 	}
 
-	// Draw the quad with a clean pipeline.
+	// Draw the quad with a clean pipeline. GL_FRAMEBUFFER (READ + DRAW)
+	// binds to 0 here, which also pins the menu-capture contract: the
+	// in-game menu's GFX_GL_screenCapture (glReadPixels) reads the READ
+	// binding and must see the PRESENTED frame, not the 1024x1024 render
+	// FBO (that would give the 640x480 content anchored bottom-left, game
+	// shifted left with an empty band). ma_gl_reset_core_state does not
+	// touch bindings; glsm's next STATE_BIND restores the core's FBO
+	// (default_framebuffer == ma_gl_fbo) at the start of retro_run.
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
 	glClearColor(0.f, 0.f, 0.f, 1.f);
@@ -478,9 +493,8 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 
 void MA_GL_set_rotation(unsigned rotation) {
 	ma_gl_rotation = rotation % 4;
-	LOG_info("minarch: SET_ROTATION %u -> present rotates %u deg (%s path)\n",
-		rotation, ma_gl_rotation * 90,
-		ma_gl_rotation == 0 ? "blit" : "quad");
+	LOG_info("minarch: SET_ROTATION %u -> present rotates %u deg (quad path)\n",
+		rotation, ma_gl_rotation * 90);
 }
 
 // Frame-rate throttle, same scheme as GFX_flip_fixed_rate (api.c): schedule
@@ -621,51 +635,12 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 
 	SDL_GL_MakeCurrent(win, ctx);
 
-	if (ma_gl_rotation != 0) {
-		// Vertical/rotated game (flycast ROT270 etc.): the core rendered
-		// unrotated into the FBO and asked us to rotate the output.
-		// RetroArch-style quad present with per-frame state management.
-		ma_gl_present_quad(width, height);
-		SDL_GL_SwapWindow(win);
-		return;
-	}
-
-	// Frontend Screen Scaling -> target-side viewport (RA GLES model, see
-	// ma_gl_compute_present_rect for the math and mode mapping). The whole
-	// source frame is blitted into the computed screen rect below.
-	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
-	ma_gl_compute_present_rect((int)width, (int)height,
-			&dst_x, &dst_y, &dst_w, &dst_h);
-	// Screen X/Y offsets (frontend-specific): blit hands dst_y straight to
-	// glBlitFramebuffer (GL window coords, y up), so +screeny moves the
-	// picture up -- same +y-up behavior as the software path. (The quad
-	// path subtracts instead: its NDC conversion flips the y direction.)
-	dst_x += screenx;
-	dst_y += screeny;
-
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-	glClearColor(0, 0, 0, 1);
-	glClear(GL_COLOR_BUFFER_BIT);
-
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, ma_gl_fbo);
-	// Blit the WHOLE source frame into the computed screen rect (RA never
-	// changes source coordinates); parts of the rect past the screen are
-	// clipped by the viewport (CROPPED cover / forced crop).
-	glBlitFramebuffer(0, 0, (int)width, (int)height,
-			dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
-			GL_COLOR_BUFFER_BIT,
-			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
-
-	// Leave the read binding on the default framebuffer so the in-game
-	// menu's GFX_GL_screenCapture (glReadPixels) grabs what is actually on
-	// screen (the presented, centered frame) instead of the 1024x1024 render
-	// FBO - reading that would return the 640x480 content anchored at its
-	// bottom-left, i.e. the game shifted left with an empty band on the right.
-	// Safe for flycast: glsm's next STATE_BIND restores the core's FBO
-	// binding (default_framebuffer == ma_gl_fbo) at the start of retro_run.
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-
+	// Single present path for every orientation (landscape included): the
+	// core renders into the frontend FBO and we present it as a textured
+	// quad -- see ma_gl_present_quad. Landscape previously used
+	// glBlitFramebuffer; it was folded in so rotation, scaling, sharpness,
+	// offsets and core-state management each live in exactly one place.
+	ma_gl_present_quad(width, height);
 	SDL_GL_SwapWindow(win);
 }
 
