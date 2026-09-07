@@ -387,6 +387,36 @@ static void ma_gl_compute_present_rect(int width, int height,
 // implementation-defined), and sharpness, offsets and core-state reset
 // apply in one place. Performance is equivalent: a scaling blit on Mali is
 // internally a sampling draw, same as this quad.
+
+// Draw a passthrough quad for the Screen Effect / Overlay textures. Unlike
+// the FBO texture (content anchored at its GL bottom-left, v up), these RGBA
+// surfaces have row 0 at the TOP, so v runs top-down on screen; UVs span the
+// whole texture. The caller must have blending enabled (alpha compositing)
+// and the present program + VAO/VBO already bound.
+static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
+	float cx0 = 2.0f * x / DEVICE_WIDTH - 1.0f;
+	float cx1 = 2.0f * (x + w) / DEVICE_WIDTH - 1.0f;
+	float cy0 = 1.0f - 2.0f * (y + h) / DEVICE_HEIGHT; // bottom
+	float cy1 = 1.0f - 2.0f * y / DEVICE_HEIGHT;       // top
+
+	// Per-vertex (x, y, u, v), triangle strip order BL, BR, TL, TR; row 0
+	// of the surface (image top) maps to v = 0 (screen top).
+	float verts[16] = {
+		cx0, cy0, 0.f, 1.f,   // bottom-left
+		cx1, cy0, 1.f, 1.f,   // bottom-right
+		cx0, cy1, 0.f, 0.f,   // top-left
+		cx1, cy1, 1.f, 0.f,   // top-right
+	};
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	// Same filter the software path sets on these textures (generic_video.c
+	// upload block): NEAREST.
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (!ma_gl_present_prog && !ma_gl_present_init())
 		return;
@@ -486,6 +516,31 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
 			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+	// Frontend Screen Effect + Overlay (software-path features mirrored
+	// here, same draw order: game -> effect -> overlay). The effect
+	// anchors at the game rect with its own size; the overlay is
+	// fullscreen. Both are RGBA with alpha, so blending is on for these
+	// two draws (ma_gl_reset_core_state leaves it in the state flycast
+	// expects). The effect PNG density follows the integer scale the
+	// software scaler would report, derived here from the present rect.
+	int fx_scale_w = dst_w / (width ? (int)width : 1);
+	int fx_scale_h = dst_h / (height ? (int)height : 1);
+	int fx_scale = (fx_scale_w <= fx_scale_h) ? fx_scale_w : fx_scale_h;
+	if (fx_scale < 1) fx_scale = 1;
+	GFX_setEffectScale(fx_scale);
+	GFX_prepare_overlay_textures();
+	int fx_w = 0, fx_h = 0, ov_w = 0, ov_h = 0;
+	GLuint fx_tex = GFX_effect_texture(&fx_w, &fx_h);
+	GLuint ov_tex = GFX_overlay_texture(&ov_w, &ov_h);
+	if (fx_tex || ov_tex) {
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		if (fx_tex && fx_w > 0 && fx_h > 0)
+			ma_gl_draw_overlay_quad(dst_x, dst_y, fx_w, fx_h, fx_tex);
+		if (ov_tex && ov_w > 0 && ov_h > 0)
+			ma_gl_draw_overlay_quad(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, ov_tex);
+	}
 
 	// Leave the state flycast's glcache expects (see ma_gl_reset_core_state).
 	ma_gl_reset_core_state();
