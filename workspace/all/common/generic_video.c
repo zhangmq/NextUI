@@ -2017,79 +2017,30 @@ int prepareFrameThread(void *data) {
 
 static SDL_Thread *prepare_thread = NULL;
 
-// GL context accessors for the libretro hardware-render (glsm) path
-SDL_Window* PLAT_getGLWindow(void) { return vid.window; }
-SDL_GLContext PLAT_getGLContext(void) { return vid.gl_context; }
+// Effect/overlay GL textures + bookkeeping. Shared state between the two
+// present paths (software PLAT_GL_Swap and the hw-render quad path) -- the
+// same GL context renders both, only one path runs per core.
+static GLuint effect_tex = 0;
+static int effect_w = 0, effect_h = 0;
+static GLuint overlay_tex = 0;
+static int overlay_w = 0, overlay_h = 0;
 
-void PLAT_GL_Swap() {
-
-	//uint64_t performance_frequency = SDL_GetPerformanceFrequency();
-	//uint64_t frame_start = SDL_GetPerformanceCounter();
-
+// The prep thread loads effect/overlay surfaces for BOTH present paths
+// (software PLAT_GL_Swap and the hw-render quad path); start it lazily
+// from whichever path first needs it.
+static void ensure_prepare_thread(void) {
 	if (prepare_thread == NULL) {
-        prepare_thread = SDL_CreateThread(prepareFrameThread, "PrepareFrameThread", NULL);
-
-        if (prepare_thread == NULL) {
-            LOG_error("Error creating background thread: %s\n", SDL_GetError());
-            return;
-        }
-    }
-
-    static int lastframecount = 0;
-    if (reloadShaderTextures) lastframecount = frame_count;
-    if (frame_count < lastframecount + 3 || notif.clear_frames > 0) {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        if (notif.clear_frames > 0) notif.clear_frames--;
-    }
-
-    SDL_Rect dst_rect = {0, 0, device_width, device_height};
-    setRectToAspectRatio(&dst_rect);
-
-    if (!vid.blit->src) {
-        return;
-    }
-
-	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
-
-	static GLuint effect_tex = 0;
-	static int effect_w = 0, effect_h = 0;
-	static GLuint overlay_tex = 0;
-	static int overlay_w = 0, overlay_h = 0;
-	static int overlayload = 0;
-
-	static GLuint src_texture = 0;
-	static int src_w_last = 0, src_h_last = 0;
-	static int last_w = 0, last_h = 0;
-
-	if (shaderResetRequested) {
-		if (orig_texture) { glDeleteTextures(1, &orig_texture); orig_texture = 0; }
-		src_w_last = src_h_last = 0;
-		last_w = last_h = 0;
-		if (effect_tex) {
-			glDeleteTextures(1, &effect_tex);
-			effect_tex = 0;
-			effect_w = effect_h = 0;
-			// Force reload by marking as ready again if effect is active
-			pthread_mutex_lock(&video_prep_mutex);
-			if (effect.type != EFFECT_NONE) {
-				frame_prep.effect_ready = 1;
-			}
-			pthread_mutex_unlock(&video_prep_mutex);
+		prepare_thread = SDL_CreateThread(prepareFrameThread, "PrepareFrameThread", NULL);
+		if (prepare_thread == NULL) {
+			LOG_error("Error creating background thread: %s\n", SDL_GetError());
 		}
-		if (overlay_tex) {
-			glDeleteTextures(1, &overlay_tex);
-			overlay_tex = 0;
-			overlay_w = overlay_h = 0;
-			// Force reload if we had an overlay
-			pthread_mutex_lock(&video_prep_mutex);
-			if (frame_prep.loaded_overlay) {
-				frame_prep.overlay_ready = 1;
-			}
-			pthread_mutex_unlock(&video_prep_mutex);
-		}
-		reloadShaderTextures = 1;
 	}
+}
 
+// Consume the prep thread's effect/overlay surfaces into GL textures.
+// Shared by both present paths (same GL context; only one path runs per
+// core, so each ready flag has a single consumer in practice).
+static void update_effect_overlay_textures(void) {
 	// Check if effect needs updating
 	pthread_mutex_lock(&video_prep_mutex);
 	int effect_ready = frame_prep.effect_ready;
@@ -2150,6 +2101,98 @@ void PLAT_GL_Swap() {
         frame_prep.overlay_ready = 0;
 		pthread_mutex_unlock(&video_prep_mutex);
     }
+}
+
+// GL hw-render present accessors: the quad path (ma_gl.c) polls these
+// instead of PLAT_GL_Swap (which never runs for hw-render cores).
+void PLAT_prepare_overlay_textures(void) {
+	ensure_prepare_thread();
+	update_effect_overlay_textures();
+}
+unsigned int PLAT_effect_texture(int *w, int *h) {
+	if (w) *w = effect_w;
+	if (h) *h = effect_h;
+	return effect_tex;
+}
+unsigned int PLAT_overlay_texture(int *w, int *h) {
+	if (w) *w = overlay_w;
+	if (h) *h = overlay_h;
+	return overlay_tex;
+}
+// Effect PNG density selection (line-N.png / grid-N.png) follows the same
+// integer scale the software scaler reports via PLAT_getScaler; the
+// hw-render path feeds it from its present rect instead.
+void PLAT_setEffectScale(int scale) {
+	pthread_mutex_lock(&video_prep_mutex);
+	effect.next_scale = scale;
+	pthread_mutex_unlock(&video_prep_mutex);
+}
+
+// GL context accessors for the libretro hardware-render (glsm) path
+SDL_Window* PLAT_getGLWindow(void) { return vid.window; }
+SDL_GLContext PLAT_getGLContext(void) { return vid.gl_context; }
+
+void PLAT_GL_Swap() {
+
+	//uint64_t performance_frequency = SDL_GetPerformanceFrequency();
+	//uint64_t frame_start = SDL_GetPerformanceCounter();
+
+	ensure_prepare_thread();
+
+    static int lastframecount = 0;
+    if (reloadShaderTextures) lastframecount = frame_count;
+    if (frame_count < lastframecount + 3 || notif.clear_frames > 0) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        if (notif.clear_frames > 0) notif.clear_frames--;
+    }
+
+    SDL_Rect dst_rect = {0, 0, device_width, device_height};
+    setRectToAspectRatio(&dst_rect);
+
+    if (!vid.blit->src) {
+        return;
+    }
+
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+
+	static int overlayload = 0;
+
+	static GLuint src_texture = 0;
+	static int src_w_last = 0, src_h_last = 0;
+	static int last_w = 0, last_h = 0;
+
+	if (shaderResetRequested) {
+		if (orig_texture) { glDeleteTextures(1, &orig_texture); orig_texture = 0; }
+		src_w_last = src_h_last = 0;
+		last_w = last_h = 0;
+		if (effect_tex) {
+			glDeleteTextures(1, &effect_tex);
+			effect_tex = 0;
+			effect_w = effect_h = 0;
+			// Force reload by marking as ready again if effect is active
+			pthread_mutex_lock(&video_prep_mutex);
+			if (effect.type != EFFECT_NONE) {
+				frame_prep.effect_ready = 1;
+			}
+			pthread_mutex_unlock(&video_prep_mutex);
+		}
+		if (overlay_tex) {
+			glDeleteTextures(1, &overlay_tex);
+			overlay_tex = 0;
+			overlay_w = overlay_h = 0;
+			// Force reload if we had an overlay
+			pthread_mutex_lock(&video_prep_mutex);
+			if (frame_prep.loaded_overlay) {
+				frame_prep.overlay_ready = 1;
+			}
+			pthread_mutex_unlock(&video_prep_mutex);
+		}
+		reloadShaderTextures = 1;
+	}
+
+	// Effect/overlay textures are consumed by the shared updater (also
+	// polled by the hw-render present path).
+	update_effect_overlay_textures();
 
 	if (!orig_texture || reloadShaderTextures) {
         // if (orig_texture) {

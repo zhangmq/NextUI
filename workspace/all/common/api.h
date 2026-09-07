@@ -314,6 +314,10 @@ SDL_Surface* GFX_init(int mode);
 #define GFX_setEffectColor PLAT_setEffectColor // (int color)
 #define GFX_setEffect PLAT_setEffect // (int effect)
 #define GFX_setOverlay PLAT_setOverlay// (int effect)
+#define GFX_setEffectScale PLAT_setEffectScale // (int scale) - effect PNG density
+#define GFX_prepare_overlay_textures PLAT_prepare_overlay_textures // (void)
+#define GFX_effect_texture PLAT_effect_texture // (int *w, int *h)
+#define GFX_overlay_texture PLAT_overlay_texture // (int *w, int *h)
 #define GFX_setOffsetX PLAT_setOffsetX// (int effect)
 #define GFX_setOffsetY PLAT_setOffsetY// (int effect)
 #define GFX_drawOnLayer PLAT_drawOnLayer //(SDL_Surface *inputSurface,int x, int y)
@@ -675,6 +679,10 @@ void PLAT_setSharpness(int sharpness);
 void PLAT_setEffectColor(int color);
 void PLAT_setEffect(int effect);
 void PLAT_setOverlay(const char* filename, const char* tag);
+void PLAT_setEffectScale(int scale);
+void PLAT_prepare_overlay_textures(void);
+unsigned int PLAT_effect_texture(int *w, int *h);
+unsigned int PLAT_overlay_texture(int *w, int *h);
 void PLAT_setOffsetX(int x);
 void PLAT_setOffsetY(int y);
 void PLAT_drawOnLayer(SDL_Surface *inputSurface, int x, int y, int w, int h, float brightness, bool maintainAspectRatio,int layer);
