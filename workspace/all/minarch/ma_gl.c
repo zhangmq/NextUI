@@ -14,6 +14,12 @@
 extern int screenx;
 extern int screeny;
 
+// Screen Sharpness (Frontend menu): defined in generic_video.c next to
+// PLAT_setSharpness. 1 = GL_LINEAR ("LINEAR"), 0 = GL_NEAREST ("NEAREST") -
+// the sampler filter for the core FBO texture at present time, mirroring
+// the software path's orig_texture sampling in the finalscale pass.
+extern int g_sharpness_linear;
+
 // The libretro hardware-render callback as negotiated with the core.
 // get_proc_address / get_current_framebuffer are owned by the frontend;
 // context_reset / context_destroy are provided by the core.
@@ -457,6 +463,13 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
+	// Screen Sharpness: re-asserted every present (2 param calls, trivial)
+	// so the sampler state stays authoritative regardless of anything the
+	// core's glcache touched between frames.
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
 	// Leave the state flycast's glcache expects (see ma_gl_reset_core_state).
@@ -641,7 +654,8 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	// clipped by the viewport (CROPPED cover / forced crop).
 	glBlitFramebuffer(0, 0, (int)width, (int)height,
 			dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
-			GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			GL_COLOR_BUFFER_BIT,
+			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
 
 	// Leave the read binding on the default framebuffer so the in-game
 	// menu's GFX_GL_screenCapture (glReadPixels) grabs what is actually on

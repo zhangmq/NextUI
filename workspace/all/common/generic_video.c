@@ -907,13 +907,21 @@ SDL_Surface* PLAT_resizeVideo(int w, int h, int p) {
 	return vid.screen;
 }
 
+// GL hw-render present filter (ma_gl.c samples the core FBO texture with
+// it). Software-path twin is s_pass_finalscale.filter (finalscale pass
+// samples orig_texture); the GL path has no shader pass to override the
+// choice (runShaderPass only runs in PLAT_GL_Swap), so the menu value
+// always applies there. 1 = GL_LINEAR ("LINEAR"), 0 = GL_NEAREST.
+int g_sharpness_linear = 1;
+
 void PLAT_setSharpness(int sharpness) {
 	if(sharpness==1) {
 		s_pass_finalscale.filter = GL_LINEAR;
-	} 
+	}
 	else {
 		s_pass_finalscale.filter = GL_NEAREST;
 	}
+	g_sharpness_linear = (sharpness == 1);
 	reloadShaderTextures = 1;
 }
 
