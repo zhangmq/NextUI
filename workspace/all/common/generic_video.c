@@ -117,6 +117,11 @@ ShaderPass s_pass_notif = { .program = &s_shader_overlay,
 
 
 static int nrofshaders = 0; // choose between 1 and 3 pipelines, > pipelines = more cpu usage, but more shader options and shader upscaling stuff
+// No-flip passthrough pass for the hw-render pipeline's final scale (the
+// chain textures are render-convention; see PLAT_run_shader_pipeline).
+static ShaderPass s_noshader_pass = { .program = &s_noshader,
+	.filter = GL_NEAREST, .alpha = 0, .target_texture = 0, .target_updated = 1
+};
 
 ///////////////////////////////
 
@@ -1737,7 +1742,7 @@ static int orig_h = 0;
 static int origtex_w = 0;
 static int origtex_h = 0;
 void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
-				   GLuint * target_texture, int next_filter,
+				   GLuint orig_texture_src, GLuint * target_texture, int next_filter,
                    int x, int y, int dst_width, int dst_height) {
 
 	static GLuint static_VAO = 0, static_VBO = 0;
@@ -1796,6 +1801,14 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	if (shader_program_handle != last_program)
 		glUseProgram(shader_program_handle);
 
+	// Bind the pipeline's own VAO/VBO before ANY attribute setup, on EVERY
+	// pass. RetroArch's GLSL backend does the same on every draw
+	// (gl_glsl_set_attribs: bind vbo -> pointers -> unbind), because other
+	// draws leave their own VAO/ARRAY_BUFFER bound between passes -- the
+	// hw-render normalize quad binds present_vao/present_vbo every frame --
+	// and relying on the residual state froze the chain on its first frame
+	// (the pass strip got clipped away) and corrupted the final pass (the
+	// pointer setup captured the wrong buffer).
 	if (static_VAO == 0) {
 		glGenVertexArrays(1, &static_VAO);
 		glGenBuffers(1, &static_VBO);
@@ -1811,19 +1824,29 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 		};
 
 		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+	} else {
+		glBindVertexArray(static_VAO);
+		glBindBuffer(GL_ARRAY_BUFFER, static_VBO);
 	}
 
+	// Attribute pointers are re-established on EVERY pass (RetroArch re-runs
+	// gl_glsl_set_coords per draw); attrib locations are per-program, so
+	// they are queried by name each time.
+	GLint posAttrib = glGetAttribLocation(shader_program_handle, "VertexCoord");
+	GLint texAttrib = glGetAttribLocation(shader_program_handle, "TexCoord");
+	if (posAttrib >= 0) {
+		glVertexAttribPointer(posAttrib, 4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+		glEnableVertexAttribArray(posAttrib);
+	}
+	if (texAttrib >= 0) {
+		glVertexAttribPointer(texAttrib,  4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(4 * sizeof(float)));
+		glEnableVertexAttribArray(texAttrib);
+	}
+	// RetroArch unbinds ARRAY_BUFFER right after capturing the pointers, so
+	// a later bind by another draw cannot affect this pipeline's state.
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
 	if (shader_program_handle != last_program) {
-		GLint posAttrib = glGetAttribLocation(shader_program_handle, "VertexCoord");
-		if (posAttrib >= 0) {
-			glVertexAttribPointer(posAttrib, 4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-			glEnableVertexAttribArray(posAttrib);
-		}
-		GLint texAttrib = glGetAttribLocation(shader_program_handle, "TexCoord");
-		if (texAttrib >= 0) {
-			glVertexAttribPointer(texAttrib,  4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(4 * sizeof(float)));
-			glEnableVertexAttribArray(texAttrib);
-		}
 
 		if (shader_program->u_FrameDirection >= 0) glUniform1i(shader_program->u_FrameDirection, 1);
 		if (shader_program->u_FrameCount >= 0) glUniform1i(shader_program->u_FrameCount, frame_count);
@@ -1846,7 +1869,6 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 			};
 			glUniformMatrix4fv(u_MVP, 1, GL_FALSE, identity);
 		}
-		glBindVertexArray(static_VAO);
 	}
 	if (target_texture) {
 		if (*target_texture != 0 && !glIsTexture(*target_texture)) {
@@ -1912,7 +1934,7 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	if (shader_program->u_OrigTexture >= 0) {
 		glUniform1i(shader_program->u_OrigTexture, 1);
 		glActiveTexture(GL_TEXTURE0+1);
-		glBindTexture(GL_TEXTURE_2D, orig_texture);
+		glBindTexture(GL_TEXTURE_2D, orig_texture_src);
 		glActiveTexture(GL_TEXTURE0);
 	}
 	
@@ -1923,6 +1945,103 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	}
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	last_program = shader_program_handle;
+}
+
+// Run the configured shader chain (0..MAXSHADERS passes) followed by the
+// finalscale pass into dst_rect. Shared by BOTH present paths: the software
+// path passes the uploaded frame texture (also used as the OrigTexture
+// uniform source), the hw-render path passes its normalized chain-source
+// texture. Consumes reloadShaderTextures (chain metadata and texture
+// params are rebuilt when set). No software-only state (vid.blit) is
+// referenced: frame dimensions arrive as parameters.
+void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
+		int frame_w, int frame_h, int final_noflip,
+		int dst_x, int dst_y, int dst_w, int dst_h) {
+	int last_w = frame_w, last_h = frame_h;
+	// Chain-pass uniform inputs: the "original frame" is the pipeline source.
+	orig_w = frame_w; orig_h = frame_h;
+	origtex_w = frame_w; origtex_h = frame_h;
+
+	for (int i = 0; i < nrofshaders; i++) {
+		int src_w = last_w;
+		int src_h = last_h;
+		int pass_dst_w = src_w * shaders[i].scale;
+		int pass_dst_h = src_h * shaders[i].scale;
+
+		if (shaders[i].scale == 9) {
+			pass_dst_w = dst_w;
+			pass_dst_h = dst_h;
+		}
+
+		if (reloadShaderTextures) {
+			for (int j = i; j < nrofshaders; j++) {
+				int real_input_w = (i == 0) ? frame_w : src_w;
+				int real_input_h = (i == 0) ? frame_h : src_h;
+				shaders[j].srcw = shaders[j].srctype == 0 ? frame_w : shaders[j].srctype == 2 ? dst_w : real_input_w;
+				shaders[j].srch = shaders[j].srctype == 0 ? frame_h : shaders[j].srctype == 2 ? dst_h : real_input_h;
+				shaders[j].texw = shaders[j].scaletype == 0 ? frame_w : shaders[j].scaletype == 2 ? dst_w : real_input_w;
+				shaders[j].texh = shaders[j].scaletype == 0 ? frame_h : shaders[j].scaletype == 2 ? dst_h : real_input_h;
+			}
+		}
+
+		static int shaderinfocount = 0;
+		static int shaderinfoscreen = 0;
+		if (shaderinfocount > 600 && shaderinfoscreen == i) {
+			currentshaderpass = i + 1;
+			currentshadertexw = shaders[i].texw;
+			currentshadertexh = shaders[i].texh;
+			currentshadersrcw = shaders[i].srcw;
+			currentshadersrch = shaders[i].srch;
+			currentshaderdstw = pass_dst_w;
+			currentshaderdsth = pass_dst_h;
+			shaderinfocount = 0;
+			shaderinfoscreen++;
+			if (shaderinfoscreen >= nrofshaders)
+				shaderinfoscreen = 0;
+		}
+		shaderinfocount++;
+
+		runShaderPass(
+			&shaders[i],
+			(i == 0) ? src_texture : shaders[i - 1].target_texture,
+			orig_texture_src,
+			&shaders[i].target_texture,
+			(i == nrofshaders - 1) ? s_pass_finalscale.filter : shaders[i+1].filter,
+			0, 0, pass_dst_w, pass_dst_h);
+
+		last_w = pass_dst_w;
+		last_h = pass_dst_h;
+	}
+
+	GLuint final_src = (nrofshaders > 0) ? shaders[nrofshaders - 1].target_texture : src_texture;
+	// Final scale-to-screen pass. The software path samples a CPU-uploaded
+	// texture (v=0 = image top) through default.glsl's 1-v flip; the
+	// hw-render path's chain textures are in RENDER convention (v=1 = top,
+	// matching the pass VBO and the no-flip community fragments), so it
+	// uses the no-flip passthrough program instead.
+	ShaderPass * final_pass = final_noflip ? &s_noshader_pass : &s_pass_finalscale;
+	final_pass->srcw = final_pass->texw = last_w;
+	final_pass->srch = final_pass->texh = last_h;
+	runShaderPass(
+		final_pass,
+		final_src,
+		orig_texture_src,
+		NULL,
+		GL_NONE,
+		dst_x, dst_y, dst_w, dst_h);
+
+	reloadShaderTextures = 0;
+}
+
+// GL-side queries: whether a shader chain is configured, and the filter the
+// chain's first pass expects on its source texture (the software path
+// applies it to orig_texture at upload; the hw-render path applies it to
+// its normalized chain-source texture).
+int PLAT_shaders_active(void) {
+	return nrofshaders > 0;
+}
+int PLAT_first_shader_filter(void) {
+	return (nrofshaders > 0) ? shaders[0].filter : 0;
 }
 
 typedef struct {
@@ -2224,84 +2343,15 @@ void PLAT_GL_Swap() {
     last_w = vid.blit->src_w;
     last_h = vid.blit->src_h;
 
-    for (int i = 0; i < nrofshaders; i++) {
-        int src_w = last_w;
-        int src_h = last_h;
-        int dst_w = src_w * shaders[i].scale;
-        int dst_h = src_h * shaders[i].scale;
-
-        if (shaders[i].scale == 9) {
-            dst_w = dst_rect.w;
-            dst_h = dst_rect.h;
-        }
-
-        if (reloadShaderTextures) {
-            for (int j = i; j < nrofshaders; j++) {
-                int real_input_w = (i == 0) ? vid.blit->src_w : last_w;
-                int real_input_h = (i == 0) ? vid.blit->src_h : last_h;
-
-                shaders[i].srcw = shaders[i].srctype == 0 ? vid.blit->src_w : shaders[i].srctype == 2 ? dst_rect.w : real_input_w;
-                shaders[i].srch = shaders[i].srctype == 0 ? vid.blit->src_h : shaders[i].srctype == 2 ? dst_rect.h : real_input_h;
-                shaders[i].texw = shaders[i].scaletype == 0 ? vid.blit->src_w : shaders[i].scaletype == 2 ? dst_rect.w : real_input_w;
-                shaders[i].texh = shaders[i].scaletype == 0 ? vid.blit->src_h : shaders[i].scaletype == 2 ? dst_rect.h : real_input_h;
-            }
-        }
-
-        static int shaderinfocount = 0;
-        static int shaderinfoscreen = 0;
-        if (shaderinfocount > 600 && shaderinfoscreen == i) {
-            currentshaderpass = i + 1;
-            currentshadertexw = shaders[i].texw;
-            currentshadertexh = shaders[i].texh;
-            currentshadersrcw = shaders[i].srcw;
-            currentshadersrch = shaders[i].srch;
-            currentshaderdstw = dst_w;
-            currentshaderdsth = dst_h;
-            shaderinfocount = 0;
-            shaderinfoscreen++;
-            if (shaderinfoscreen >= nrofshaders)
-                shaderinfoscreen = 0;
-        }
-        shaderinfocount++;
-
-        runShaderPass(
-			&shaders[i],
-			(i == 0) ? orig_texture : shaders[i - 1].target_texture,
-			&shaders[i].target_texture,
-			(i == nrofshaders - 1) ? s_pass_finalscale.filter : shaders[i+1].filter,
-			0, 0, dst_w, dst_h);
-
-        last_w = dst_w;
-        last_h = dst_h;
-    }
-
-    if (nrofshaders > 0) {
-		//LOG_info("Shader Pass: Scale to screen (pipeline size: %d)\n", nrofshaders);
-		s_pass_finalscale.srcw = s_pass_finalscale.texw = last_w;
-		s_pass_finalscale.srch = s_pass_finalscale.texh = last_h;
-		runShaderPass(
-			&s_pass_finalscale,
-			shaders[nrofshaders - 1].target_texture,
-			NULL,
-			GL_NONE,
-            dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h);
-    }
-	else {
-		//LOG_info("Shader Pass: Scale to screen (pipeline size: %d)\n", nrofshaders);
-		s_pass_finalscale.srcw = s_pass_finalscale.texw = orig_w;
-		s_pass_finalscale.srch = s_pass_finalscale.texh = orig_h;
-		runShaderPass(
-			&s_pass_finalscale,
-			orig_texture,
-			NULL,
-			GL_NONE,
-            dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h);
-    }
+	PLAT_run_shader_pipeline(orig_texture, orig_texture,
+			last_w, last_h, 0,
+			dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h);
 
     if (effect_tex) {
 		//LOG_info("Shader Pass: Screen Effect\n");
         runShaderPass(
-			&s_pass_overlay, effect_tex, NULL,
+			&s_pass_overlay, effect_tex, orig_texture,
+			NULL,
 			GL_NONE,
 			dst_rect.x, dst_rect.y, effect_w, effect_h);
     }
@@ -2309,7 +2359,8 @@ void PLAT_GL_Swap() {
     if (overlay_tex) {
 		//LOG_info("Shader Pass: Overlay\n");
         runShaderPass(
-			&s_pass_overlay, overlay_tex, NULL,
+			&s_pass_overlay, overlay_tex, orig_texture,
+			NULL,
 			GL_NONE,
             0, 0, device_width, device_height);
     }
@@ -2325,7 +2376,8 @@ void PLAT_GL_Swap() {
 
     if (notif.tex && notif.surface) {
 		runShaderPass(
-			&s_pass_overlay, notif.tex, NULL,
+			&s_pass_overlay, notif.tex, orig_texture,
+			NULL,
 			GL_NONE,
 			notif.x, notif.y, notif.tex_w, notif.tex_h);
     }

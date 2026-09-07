@@ -315,6 +315,9 @@ SDL_Surface* GFX_init(int mode);
 #define GFX_setEffect PLAT_setEffect // (int effect)
 #define GFX_setOverlay PLAT_setOverlay// (int effect)
 #define GFX_setEffectScale PLAT_setEffectScale // (int scale) - effect PNG density
+#define GFX_run_shader_pipeline PLAT_run_shader_pipeline // (src, orig, fw, fh, final_noflip, dx, dy, dw, dh)
+#define GFX_shaders_active PLAT_shaders_active // (void) - chain configured?
+#define GFX_first_shader_filter PLAT_first_shader_filter // (void) - pass0 src filter, 0 if none
 #define GFX_prepare_overlay_textures PLAT_prepare_overlay_textures // (void)
 #define GFX_effect_texture PLAT_effect_texture // (int *w, int *h)
 #define GFX_overlay_texture PLAT_overlay_texture // (int *w, int *h)
@@ -680,6 +683,10 @@ void PLAT_setEffectColor(int color);
 void PLAT_setEffect(int effect);
 void PLAT_setOverlay(const char* filename, const char* tag);
 void PLAT_setEffectScale(int scale);
+void PLAT_run_shader_pipeline(unsigned int src_texture, unsigned int orig_texture_src,
+		int frame_w, int frame_h, int final_noflip, int dst_x, int dst_y, int dst_w, int dst_h);
+int PLAT_shaders_active(void);
+int PLAT_first_shader_filter(void);
 void PLAT_prepare_overlay_textures(void);
 unsigned int PLAT_effect_texture(int *w, int *h);
 unsigned int PLAT_overlay_texture(int *w, int *h);
