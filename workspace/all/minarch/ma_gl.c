@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 
 #include <GLES3/gl3.h> // FBO + VAO (GLES3; Mali libGLESv2 exports them)
 
@@ -417,6 +419,100 @@ static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
+// Shader-chain source normalization. The chain's pass shaders follow the
+// RA glsl convention (VBO v=1 at quad top + community fragments sample v
+// directly), which pairs with textures in the RENDER convention: content
+// fills the whole texture with v=1 = image top. The FBO texture is render
+// output too (v=1 = top) but oversized (1024x1024, content in the
+// bottom-left [0..tw]x[0..th] region), so the chain source is re-rendered
+// into a frame-sized texture with the game quad's ROTATION UV table --
+// this also bakes SET_ROTATION in (the chain and finalscale then operate
+// in screen orientation; software cores have no rotation, this is the
+// hw-render-only difference the chain must absorb). One fullscreen pass.
+static GLuint ma_gl_chain_tex = 0, ma_gl_chain_fbo = 0;
+static int ma_gl_chain_w = 0, ma_gl_chain_h = 0;
+
+static void ma_gl_normalize_source(unsigned width, unsigned height) {
+	// Chain dims = ROTATED display dims (swap for 90/270).
+	int cw = width, ch = height;
+	if (ma_gl_rotation % 2 == 1) { cw = height; ch = width; }
+
+	if (ma_gl_chain_w != cw || ma_gl_chain_h != ch) {
+		if (ma_gl_chain_tex) glDeleteTextures(1, &ma_gl_chain_tex);
+		if (ma_gl_chain_fbo) glDeleteFramebuffers(1, &ma_gl_chain_fbo);
+		glGenTextures(1, &ma_gl_chain_tex);
+		glBindTexture(GL_TEXTURE_2D, ma_gl_chain_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cw, ch, 0,
+				GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glGenFramebuffers(1, &ma_gl_chain_fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_chain_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				GL_TEXTURE_2D, ma_gl_chain_tex, 0);
+		ma_gl_chain_w = cw;
+		ma_gl_chain_h = ch;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_chain_fbo);
+	glViewport(0, 0, cw, ch);
+
+	// State resets BEFORE the clear: flycast leaves GL_SCISSOR_TEST enabled
+	// with its own render window at frame end, and both the clear and the
+	// quad would be clipped to that window (normalize output partially
+	// uninitialized -> garbage through the chain).
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glUseProgram(ma_gl_present_prog);
+	glBindVertexArray(ma_gl_present_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+
+	// Game quad's UV table for the current rotation, dst = full target.
+	// Same sampling mapping as the no-shader game quad, so the content
+	// lands rotated + right side up in render convention (v=1 = top).
+	float tw = (float)width / MA_GL_FBO_MAX_W;
+	float th = (float)height / MA_GL_FBO_MAX_H;
+	float verts[16] = { 0 };
+	switch (ma_gl_rotation % 4) {
+	case 1:
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=0.f;    verts[3]=th;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=0.f;    verts[7]=0.f;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=tw;    verts[11]=th;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=tw;  verts[15]=0.f;
+		break;
+	case 2:
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=tw;    verts[3]=th;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=0.f;    verts[7]=th;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=tw;    verts[11]=0.f;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=0.f;  verts[15]=0.f;
+		break;
+	case 3:
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=tw;    verts[3]=0.f;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=tw;    verts[7]=th;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=0.f;   verts[11]=0.f;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=0.f;  verts[15]=th;
+		break;
+	default: // 0
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=0.f;    verts[3]=0.f;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=tw;     verts[7]=0.f;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=0.f;   verts[11]=th;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=tw;   verts[15]=th;
+		break;
+	}
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (!ma_gl_present_prog && !ma_gl_present_init())
 		return;
@@ -494,28 +590,47 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// (default_framebuffer == ma_gl_fbo) at the start of retro_run.
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-	glClearColor(0.f, 0.f, 0.f, 1.f);
-	glClear(GL_COLOR_BUFFER_BIT);
+	// State resets BEFORE the clear (scissor: flycast leaves its own
+	// render window enabled at frame end -- see ma_gl_reset_core_state).
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_STENCIL_TEST);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_BLEND);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
 
-	glUseProgram(ma_gl_present_prog);
-	glBindVertexArray(ma_gl_present_vao);
-	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
-	// Screen Sharpness: re-asserted every present (2 param calls, trivial)
-	// so the sampler state stays authoritative regardless of anything the
-	// core's glcache touched between frames.
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-			g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	if (GFX_shaders_active()) {
+		// Shader chain (Frontend -> Shaders): normalize the FBO into the
+		// software pipeline's texture convention, then run the chain +
+		// finalscale with the shared orchestrator. The chain's first pass
+		// samples the normalized texture with shaders[0].filter -- the
+		// software rule where the chain overrides Screen Sharpness.
+		ma_gl_normalize_source(width, height);
+		glBindTexture(GL_TEXTURE_2D, ma_gl_chain_tex);
+		// GFX_first_shader_filter returns the GL constant directly
+		// (GL_LINEAR / GL_NEAREST; 0 = no chain, not reachable here).
+		int src_filter = GFX_first_shader_filter();
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, src_filter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, src_filter);
+		GFX_run_shader_pipeline(ma_gl_chain_tex, ma_gl_chain_tex,
+				width, height, 1, dst_x, dst_y, dst_w, dst_h);
+	} else {
+		glUseProgram(ma_gl_present_prog);
+		glBindVertexArray(ma_gl_present_vao);
+		glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
+		// Screen Sharpness: re-asserted every present (2 param calls,
+		// trivial) so the sampler state stays authoritative regardless of
+		// anything the core's glcache touched between frames.
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	}
 
 	// Frontend Screen Effect + Overlay (software-path features mirrored
 	// here, same draw order: game -> effect -> overlay). The effect
@@ -530,6 +645,18 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (fx_scale < 1) fx_scale = 1;
 	GFX_setEffectScale(fx_scale);
 	GFX_prepare_overlay_textures();
+	// The shader chain runs on its own program/VAO, leaves the viewport at
+	// the final pass's rect, and may leave TEXTURE1 bound; re-establish the
+	// present program's state (fullscreen viewport, no scissor) before
+	// overlaying.
+	glUseProgram(ma_gl_present_prog);
+	glBindVertexArray(ma_gl_present_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
+	glDisable(GL_SCISSOR_TEST);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glActiveTexture(GL_TEXTURE0);
 	int fx_w = 0, fx_h = 0, ov_w = 0, ov_h = 0;
 	GLuint fx_tex = GFX_effect_texture(&fx_w, &fx_h);
 	GLuint ov_tex = GFX_overlay_texture(&ov_w, &ov_h);
