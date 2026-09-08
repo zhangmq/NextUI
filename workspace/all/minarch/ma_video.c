@@ -475,6 +475,15 @@ void selectScaler(int src_w, int src_h, int src_p) {
 		// TODO: or is it just that I'm trying to cram 4 logical rects into 2 rect arguments
 		// TODO: eg. src.size + src.clip + dst.size + dst.clip
 		else if (scaling==SCALE_CROPPED) {
+			// RA Integer Scale (video_viewport_get_scaled_integer), CEILING
+			// direction -- same semantics as the GL hw-render path (ma_gl.c
+			// ma_gl_compute_present_rect): the source is NOT cropped here
+			// (the GL present pipeline uploads src_w x src_h from the frame
+			// start with no src_x/src_y offset; cropping the source is what
+			// garbles it). The cover rect is the centered dst that
+			// setRectToAspectRatio produces (src*scale centered, may extend
+			// past the screen); runShaderPass draws it with
+			// glViewport(x,y,w,h) whose overflow is clipped by the window.
 			int scale_x = CEIL_DIV(DEVICE_WIDTH, src_w);
 			int scale_y = CEIL_DIV(DEVICE_HEIGHT, src_h);
 			scale = MIN(scale_x, scale_y);
@@ -483,30 +492,6 @@ void selectScaler(int src_w, int src_h, int src_p) {
 			dst_w = DEVICE_WIDTH;
 			dst_h = DEVICE_HEIGHT;
 			dst_p = DEVICE_PITCH;
-
-			int scaled_w = src_w * scale;
-			int scaled_h = src_h * scale;
-
-			int ox = (DEVICE_WIDTH  - scaled_w) / 2; // may be negative
-			int oy = (DEVICE_HEIGHT - scaled_h) / 2; // may be negative
-
-			if (ox<0) {
-				src_x = -ox / scale;
-				src_w -= src_x * 2;
-			}
-			else {
-				dst_x = ox;
-				// dst_w -= ox * 2;
-			}
-
-			if (oy<0) {
-				src_y = -oy / scale;
-				src_h -= src_y * 2;
-			}
-			else {
-				dst_y = oy;
-				// dst_h -= oy * 2;
-			}
 		}
 		else {
 			sprintf(scaler_name, "integer");

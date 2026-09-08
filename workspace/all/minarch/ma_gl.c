@@ -2,11 +2,25 @@
 #include <stdio.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 
-#include <GLES3/gl3.h> // FBO / glBlitFramebuffer (GLES3; Mali libGLESv2 exports them)
+#include <GLES3/gl3.h> // FBO + VAO (GLES3; Mali libGLESv2 exports them)
 
 #include "ma_internal.h"
 #include "ma_gl.h"
+
+// Screen X/Y raw offsets (Frontend menu): defined in generic_video.c as
+// screenx = x - 64 / screeny = y - 64 (range -64..64 px). No header
+// declaration exists - extern here for the present-rect computation.
+extern int screenx;
+extern int screeny;
+
+// Screen Sharpness (Frontend menu): defined in generic_video.c next to
+// PLAT_setSharpness. 1 = GL_LINEAR ("LINEAR"), 0 = GL_NEAREST ("NEAREST") -
+// the sampler filter for the core FBO texture at present time, mirroring
+// the software path's orig_texture sampling in the finalscale pass.
+extern int g_sharpness_linear;
 
 // The libretro hardware-render callback as negotiated with the core.
 // get_proc_address / get_current_framebuffer are owned by the frontend;
@@ -15,9 +29,10 @@ static struct retro_hw_render_callback hw_render;
 static bool hw_render_active = false;
 
 // Frontend hw-render FBO. The core renders into this (glsm caches the id
-// returned by get_current_framebuffer at context reset), and we blit it
-// centered onto the default framebuffer at present time -- the RetroArch
-// convention (core draws into the frontend FBO, frontend presents it).
+// returned by get_current_framebuffer at context reset), and we present it
+// centered onto the default framebuffer with a textured quad -- the
+// RetroArch convention (core draws into the frontend FBO, frontend
+// presents it).
 // Fixed max size so the id never changes after context reset.
 #define MA_GL_FBO_MAX_W 1024
 #define MA_GL_FBO_MAX_H 1024
@@ -93,8 +108,11 @@ static void ma_gl_destroy_fbo(void) {
 // using the ROTATED dimensions, mirroring RA's
 // video_viewport_get_scaled_aspect2 + mvp rotation.
 //
-// Why a quad and not glBlitFramebuffer: glBlitFramebuffer cannot rotate 90
-// degrees. Why a state reset after the quad: flycast's GLES2 renderer keeps
+// Why a quad for everything: glBlitFramebuffer cannot rotate 90 degrees,
+// and its scaling filter kernel is implementation-defined while a sampler
+// is spec-defined - one quad path keeps rotation, filtering, offsets and
+// state management in a single place. Why a state reset after the quad:
+// flycast's GLES2 renderer keeps
 // its own GL state shadow (glcache, core/rend/gles/glcache.h) that SKIPS real
 // gl calls when the cached value matches the requested one, and glsm's
 // STATE_BIND only resets program/viewport/textures/attribs/FBO - caps and
@@ -222,6 +240,135 @@ static void ma_gl_reset_core_state(void) {
 	glActiveTexture(GL_TEXTURE0);
 }
 
+// ---------------------------------------------------------------------------
+// Frontend Screen Scaling -> target-side viewport (RetroArch GLES model).
+//
+// PORTING FIDELITY: RetroArch's GLES driver computes the destination with a
+// pure target-side viewport model -- the keep-aspect/stretch branches of
+// gl2_set_viewport (gfx/drivers/gl.c, ra-ref/gl19.c:384-478) plus
+// video_viewport_get_scaled_integer for the integer branch (video_driver.c,
+// ra-ref/retroarch19.c:32567-32639) -- and never touches the SOURCE rect:
+// the whole core frame is mapped into the computed screen rect. Frontend
+// mode mapping onto that model:
+//   NATIVE        -> video_scale_integer: integer scale of the core base
+//                    geometry, centered.
+//   ASPECT        -> keep_aspect, desired = core.aspect_ratio (RA "Core
+//                    provided", retroarch19.c:32111-32125).
+//   ASPECT_SCREEN -> keep_aspect, desired = source (display) frame ratio.
+//   FULLSCREEN    -> !keep_aspect: stretch to the whole screen (gl19.c:452).
+//   CROPPED       -> video_scale_integer with CEILING scale: the same RA
+//                    Integer Scale option as NATIVE (retroarch19.c:32567),
+//                    only the stepping direction differs -- ceiling covers
+//                    the screen and the symmetric overflow is clipped by the
+//                    viewport. HDMI falls back to NATIVE (minarch rule,
+//                    ma_video.c:451).
+// We do NOT call the software functions (setRectToAspectRatio dereferences
+// the software-only vid.blit state machine); the viewport math below is
+// taken verbatim from the RA GLES viewport code referenced above.
+//
+// width/height: the frame's DISPLAY geometry -- for rotated games pass the
+// width/height-swapped dims (quad path), mirroring RA's rotation handling.
+// The result is the screen-space rect (it may extend past the screen; the
+// viewport clips the overflow). The minarch-specific Screen X/Y offsets are
+// NOT part of this rect: the present path applies them to the screen-space
+// rect (see ma_gl_present_quad).
+// ---------------------------------------------------------------------------
+static void ma_gl_compute_present_rect(int width, int height,
+		int *out_x, int *out_y, int *out_w, int *out_h) {
+	int scaling = screen_scaling;
+	if (scaling == SCALE_CROPPED && DEVICE_WIDTH == HDMI_WIDTH)
+		scaling = SCALE_NATIVE; // minarch rule: no crop on HDMI
+
+	int dst_x = 0, dst_y = 0, dst_w = DEVICE_WIDTH, dst_h = DEVICE_HEIGHT;
+	float device_aspect = (float)DEVICE_WIDTH / DEVICE_HEIGHT;
+	double desired = (scaling == SCALE_ASPECT_SCREEN)
+		? (double)width / height
+		: (core.aspect_ratio > 0 ? core.aspect_ratio : (double)width / height);
+
+	if (scaling == SCALE_NATIVE || scaling == SCALE_CROPPED)
+	{
+		// video_viewport_get_scaled_integer (retroarch19.c:32567): integer
+		// scale of the core base geometry. minarch does not cache
+		// base_width/base_height, but flycast's reported base (640x480)
+		// equals the presented frame and the software scaler uses the frame
+		// size as its integer base too, so base == frame here. base_w is the
+		// square-pixel correction base_h * aspect (retroarch19.c:32610;
+		// aspect == core-reported ratio, which for flycast matches the frame;
+		// for rotated games the passed dims are already swapped, so the base
+		// follows the rotation the way RA swaps base_height, :32598).
+		unsigned base_h = (height > 0) ? height : 1;
+		unsigned base_w = (unsigned)roundf(base_h * (float)desired);
+		if (DEVICE_WIDTH >= (int)base_w && DEVICE_HEIGHT >= (int)base_h)
+		{
+			unsigned max_scale = MIN(DEVICE_WIDTH / (int)base_w,
+					DEVICE_HEIGHT / (int)base_h);
+			if (scaling == SCALE_CROPPED)
+				// Ceiling variant of RA's integer scale (video_scale_integer):
+				// cover the screen; the overflow is clipped by the viewport
+				// when rendering.
+				max_scale = MIN(CEIL_DIV(DEVICE_WIDTH, (int)base_w),
+						CEIL_DIV(DEVICE_HEIGHT, (int)base_h));
+			dst_w = (int)(base_w * max_scale);
+			dst_h = (int)(base_h * max_scale);
+			// Centered (RA: vp->x = padding_x / 2, retroarch19.c:32637).
+			dst_x = (DEVICE_WIDTH - dst_w) / 2;
+			dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+		}
+		else
+		{
+			// Source larger than the screen: the software path keeps it 1:1
+			// and lets the screen crop it ("forced crop"); the viewport clips
+			// the overflow here the same way.
+			dst_w = width;
+			dst_h = height;
+			dst_x = (DEVICE_WIDTH - dst_w) / 2;
+			dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+		}
+	}
+	else if (scaling == SCALE_FULLSCREEN)
+	{
+		// gl2_set_viewport, !keep_aspect branch (gl19.c:452-457): stretch to
+		// the whole screen.
+		dst_x = 0;
+		dst_y = 0;
+		dst_w = DEVICE_WIDTH;
+		dst_h = DEVICE_HEIGHT;
+	}
+	else // SCALE_ASPECT / SCALE_ASPECT_SCREEN: gl2_set_viewport keep_aspect
+	{
+		float delta;
+		if (fabsf(device_aspect - (float)desired) < 0.0001f)
+		{
+			/* Screen and desired aspect ratios are numerically equal
+			 * (gl19.c:426-432): full screen. */
+		}
+		else if (device_aspect > (float)desired)
+		{
+			/* Screen wider than desired -> pillarbox (gl19.c:433-437). */
+			delta = ((float)desired / device_aspect - 1.0f) / 2.0f + 0.5f;
+			dst_x = (int)roundf(DEVICE_WIDTH * (0.5f - delta));
+			dst_w = (int)roundf(2.0f * DEVICE_WIDTH * delta);
+		}
+		else
+		{
+			/* Screen taller than desired -> letterbox (gl19.c:439-443). */
+			delta = (device_aspect / (float)desired - 1.0f) / 2.0f + 0.5f;
+			dst_y = (int)roundf(DEVICE_HEIGHT * (0.5f - delta));
+			dst_h = (int)roundf(2.0f * DEVICE_HEIGHT * delta);
+		}
+	}
+
+	// Screen X/Y offsets are NOT applied here: they are frontend-specific
+	// (no RA equivalent) and applied by the single present caller
+	// (ma_gl_present_quad) to the SCREEN-space rect, with the y sign
+	// adjusted for its NDC conversion so +screeny moves the picture up.
+
+	*out_x = dst_x;
+	*out_y = dst_y;
+	*out_w = dst_w;
+	*out_h = dst_h;
+}
+
 // Present the core's FBO centered with the configured rotation via a quad.
 // Texture coordinates implement the rotation (the quad rect itself is always
 // axis-aligned, aspect-fit from the ROTATED dimensions). Verified against
@@ -234,6 +381,138 @@ static void ma_gl_reset_core_state(void) {
 // where (cx,cy) is the corner's normalized position on the display rect and
 // (tw,th) = (width,height)/FBO size map only the used region of the fixed
 // 1024x1024 FBO texture (content anchored at its GL bottom-left).
+//
+// This is the ONLY present path (landscape included). Rotation is the
+// original reason a quad exists (glBlitFramebuffer cannot rotate 90 deg);
+// folding landscape in unifies the rest: the sampler filter is the
+// spec-defined texture filter (a scaling blit's LINEAR kernel is
+// implementation-defined), and sharpness, offsets and core-state reset
+// apply in one place. Performance is equivalent: a scaling blit on Mali is
+// internally a sampling draw, same as this quad.
+
+// Draw a passthrough quad for the Screen Effect / Overlay textures. Unlike
+// the FBO texture (content anchored at its GL bottom-left, v up), these RGBA
+// surfaces have row 0 at the TOP, so v runs top-down on screen; UVs span the
+// whole texture. The caller must have blending enabled (alpha compositing)
+// and the present program + VAO/VBO already bound.
+static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
+	float cx0 = 2.0f * x / DEVICE_WIDTH - 1.0f;
+	float cx1 = 2.0f * (x + w) / DEVICE_WIDTH - 1.0f;
+	float cy0 = 1.0f - 2.0f * (y + h) / DEVICE_HEIGHT; // bottom
+	float cy1 = 1.0f - 2.0f * y / DEVICE_HEIGHT;       // top
+
+	// Per-vertex (x, y, u, v), triangle strip order BL, BR, TL, TR; row 0
+	// of the surface (image top) maps to v = 0 (screen top).
+	float verts[16] = {
+		cx0, cy0, 0.f, 1.f,   // bottom-left
+		cx1, cy0, 1.f, 1.f,   // bottom-right
+		cx0, cy1, 0.f, 0.f,   // top-left
+		cx1, cy1, 1.f, 0.f,   // top-right
+	};
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	// Same filter the software path sets on these textures (generic_video.c
+	// upload block): NEAREST.
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// Shader-chain source normalization. The chain's pass shaders follow the
+// RA glsl convention (VBO v=1 at quad top + community fragments sample v
+// directly), which pairs with textures in the RENDER convention: content
+// fills the whole texture with v=1 = image top. The FBO texture is render
+// output too (v=1 = top) but oversized (1024x1024, content in the
+// bottom-left [0..tw]x[0..th] region), so the chain source is re-rendered
+// into a frame-sized texture with the game quad's ROTATION UV table --
+// this also bakes SET_ROTATION in (the chain and finalscale then operate
+// in screen orientation; software cores have no rotation, this is the
+// hw-render-only difference the chain must absorb). One fullscreen pass.
+static GLuint ma_gl_chain_tex = 0, ma_gl_chain_fbo = 0;
+static int ma_gl_chain_w = 0, ma_gl_chain_h = 0;
+
+static void ma_gl_normalize_source(unsigned width, unsigned height) {
+	// Chain dims = ROTATED display dims (swap for 90/270).
+	int cw = width, ch = height;
+	if (ma_gl_rotation % 2 == 1) { cw = height; ch = width; }
+
+	if (ma_gl_chain_w != cw || ma_gl_chain_h != ch) {
+		if (ma_gl_chain_tex) glDeleteTextures(1, &ma_gl_chain_tex);
+		if (ma_gl_chain_fbo) glDeleteFramebuffers(1, &ma_gl_chain_fbo);
+		glGenTextures(1, &ma_gl_chain_tex);
+		glBindTexture(GL_TEXTURE_2D, ma_gl_chain_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cw, ch, 0,
+				GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glGenFramebuffers(1, &ma_gl_chain_fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_chain_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				GL_TEXTURE_2D, ma_gl_chain_tex, 0);
+		ma_gl_chain_w = cw;
+		ma_gl_chain_h = ch;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_chain_fbo);
+	glViewport(0, 0, cw, ch);
+
+	// State resets BEFORE the clear: flycast leaves GL_SCISSOR_TEST enabled
+	// with its own render window at frame end, and both the clear and the
+	// quad would be clipped to that window (normalize output partially
+	// uninitialized -> garbage through the chain).
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glUseProgram(ma_gl_present_prog);
+	glBindVertexArray(ma_gl_present_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+
+	// Game quad's UV table for the current rotation, dst = full target.
+	// Same sampling mapping as the no-shader game quad, so the content
+	// lands rotated + right side up in render convention (v=1 = top).
+	float tw = (float)width / MA_GL_FBO_MAX_W;
+	float th = (float)height / MA_GL_FBO_MAX_H;
+	float verts[16] = { 0 };
+	switch (ma_gl_rotation % 4) {
+	case 1:
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=0.f;    verts[3]=th;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=0.f;    verts[7]=0.f;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=tw;    verts[11]=th;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=tw;  verts[15]=0.f;
+		break;
+	case 2:
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=tw;    verts[3]=th;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=0.f;    verts[7]=th;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=tw;    verts[11]=0.f;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=0.f;  verts[15]=0.f;
+		break;
+	case 3:
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=tw;    verts[3]=0.f;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=tw;    verts[7]=th;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=0.f;   verts[11]=0.f;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=0.f;  verts[15]=th;
+		break;
+	default: // 0
+		verts[0]=-1.f; verts[1]=-1.f; verts[2]=0.f;    verts[3]=0.f;
+		verts[4]= 1.f; verts[5]=-1.f; verts[6]=tw;     verts[7]=0.f;
+		verts[8]=-1.f; verts[9]= 1.f; verts[10]=0.f;   verts[11]=th;
+		verts[12]= 1.f; verts[13]= 1.f; verts[14]=tw;   verts[15]=th;
+		break;
+	}
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (!ma_gl_present_prog && !ma_gl_present_init())
 		return;
@@ -245,13 +524,23 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// flycast rotated games is 0.75 = height/width of the 640x480 frame).
 	unsigned disp_w = width, disp_h = height;
 	if (ma_gl_rotation % 2 == 1) { disp_w = height; disp_h = width; }
-	// Aspect-fit into the device (no upscale, like the blit path), centered.
-	double s = fmin((double)DEVICE_WIDTH / disp_w, (double)DEVICE_HEIGHT / disp_h);
-	if (s > 1.0) s = 1.0;
-	int dst_w = (int)(disp_w * s);
-	int dst_h = (int)(disp_h * s);
-	int dst_x = (DEVICE_WIDTH - dst_w) / 2;
-	int dst_y = (DEVICE_HEIGHT - dst_h) / 2;
+	// Screen Scaling (Frontend menu) applies to the ROTATED geometry, via
+	// the shared target-side viewport model (RA GLES, see
+	// ma_gl_compute_present_rect). The rect may
+	// extend past the screen (NATIVE upscales/CROPPED covers) - the viewport
+	// clips it; upscaling a rotated frame is filtered by the texture sampler.
+	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
+	ma_gl_compute_present_rect((int)disp_w, (int)disp_h,
+			&dst_x, &dst_y, &dst_w, &dst_h);
+	// Screen X/Y offsets (frontend-specific, no RA equivalent): applied to
+	// the SCREEN-space rect. NOTE the y sign: dst_y goes through the NDC
+	// conversion below (cy = 1 - 2y/H, which treats dst_y as screen-y-down
+	// and flips it), so the offset must be SUBTRACTED here for +screeny to
+	// move the picture up on screen -- matching the software path's +y-up
+	// behavior for every orientation. The offsets must NOT be applied in
+	// the pre-rotation (content) space: that swaps x/y on rotated games.
+	dst_x += screenx;
+	dst_y -= screeny;
 
 	// NDC positions (GL y is bottom-up; screen y is top-down).
 	float cx0 = 2.0f * dst_x / DEVICE_WIDTH - 1.0f;
@@ -291,24 +580,94 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		break;
 	}
 
-	// Draw the quad with a clean pipeline.
+	// Draw the quad with a clean pipeline. GL_FRAMEBUFFER (READ + DRAW)
+	// binds to 0 here, which also pins the menu-capture contract: the
+	// in-game menu's GFX_GL_screenCapture (glReadPixels) reads the READ
+	// binding and must see the PRESENTED frame, not the 1024x1024 render
+	// FBO (that would give the 640x480 content anchored bottom-left, game
+	// shifted left with an empty band). ma_gl_reset_core_state does not
+	// touch bindings; glsm's next STATE_BIND restores the core's FBO
+	// (default_framebuffer == ma_gl_fbo) at the start of retro_run.
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-	glClearColor(0.f, 0.f, 0.f, 1.f);
-	glClear(GL_COLOR_BUFFER_BIT);
+	// State resets BEFORE the clear (scissor: flycast leaves its own
+	// render window enabled at frame end -- see ma_gl_reset_core_state).
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_STENCIL_TEST);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_BLEND);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
 
+	if (GFX_shaders_active()) {
+		// Shader chain (Frontend -> Shaders): normalize the FBO into the
+		// software pipeline's texture convention, then run the chain +
+		// finalscale with the shared orchestrator. The chain's first pass
+		// samples the normalized texture with shaders[0].filter -- the
+		// software rule where the chain overrides Screen Sharpness.
+		ma_gl_normalize_source(width, height);
+		glBindTexture(GL_TEXTURE_2D, ma_gl_chain_tex);
+		// GFX_first_shader_filter returns the GL constant directly
+		// (GL_LINEAR / GL_NEAREST; 0 = no chain, not reachable here).
+		int src_filter = GFX_first_shader_filter();
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, src_filter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, src_filter);
+		GFX_run_shader_pipeline(ma_gl_chain_tex, ma_gl_chain_tex,
+				width, height, 1, dst_x, dst_y, dst_w, dst_h);
+	} else {
+		glUseProgram(ma_gl_present_prog);
+		glBindVertexArray(ma_gl_present_vao);
+		glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
+		// Screen Sharpness: re-asserted every present (2 param calls,
+		// trivial) so the sampler state stays authoritative regardless of
+		// anything the core's glcache touched between frames.
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	}
+
+	// Frontend Screen Effect + Overlay (software-path features mirrored
+	// here, same draw order: game -> effect -> overlay). The effect
+	// anchors at the game rect with its own size; the overlay is
+	// fullscreen. Both are RGBA with alpha, so blending is on for these
+	// two draws (ma_gl_reset_core_state leaves it in the state flycast
+	// expects). The effect PNG density follows the integer scale the
+	// software scaler would report, derived here from the present rect.
+	int fx_scale_w = dst_w / (width ? (int)width : 1);
+	int fx_scale_h = dst_h / (height ? (int)height : 1);
+	int fx_scale = (fx_scale_w <= fx_scale_h) ? fx_scale_w : fx_scale_h;
+	if (fx_scale < 1) fx_scale = 1;
+	GFX_setEffectScale(fx_scale);
+	GFX_prepare_overlay_textures();
+	// The shader chain runs on its own program/VAO, leaves the viewport at
+	// the final pass's rect, and may leave TEXTURE1 bound; re-establish the
+	// present program's state (fullscreen viewport, no scissor) before
+	// overlaying.
 	glUseProgram(ma_gl_present_prog);
 	glBindVertexArray(ma_gl_present_vao);
 	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
+	glDisable(GL_SCISSOR_TEST);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, 0);
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	int fx_w = 0, fx_h = 0, ov_w = 0, ov_h = 0;
+	GLuint fx_tex = GFX_effect_texture(&fx_w, &fx_h);
+	GLuint ov_tex = GFX_overlay_texture(&ov_w, &ov_h);
+	if (fx_tex || ov_tex) {
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		if (fx_tex && fx_w > 0 && fx_h > 0)
+			ma_gl_draw_overlay_quad(dst_x, dst_y, fx_w, fx_h, fx_tex);
+		if (ov_tex && ov_w > 0 && ov_h > 0)
+			ma_gl_draw_overlay_quad(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, ov_tex);
+	}
 
 	// Leave the state flycast's glcache expects (see ma_gl_reset_core_state).
 	ma_gl_reset_core_state();
@@ -316,9 +675,8 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 
 void MA_GL_set_rotation(unsigned rotation) {
 	ma_gl_rotation = rotation % 4;
-	LOG_info("minarch: SET_ROTATION %u -> present rotates %u deg (%s path)\n",
-		rotation, ma_gl_rotation * 90,
-		ma_gl_rotation == 0 ? "blit" : "quad");
+	LOG_info("minarch: SET_ROTATION %u -> present rotates %u deg (quad path)\n",
+		rotation, ma_gl_rotation * 90);
 }
 
 // Frame-rate throttle, same scheme as GFX_flip_fixed_rate (api.c): schedule
@@ -459,46 +817,12 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 
 	SDL_GL_MakeCurrent(win, ctx);
 
-	if (ma_gl_rotation != 0) {
-		// Vertical/rotated game (flycast ROT270 etc.): the core rendered
-		// unrotated into the FBO and asked us to rotate the output.
-		// RetroArch-style quad present with per-frame state management.
-		ma_gl_present_quad(width, height);
-		SDL_GL_SwapWindow(win);
-		return;
-	}
-
-	// Present the core's FBO centered onto the default framebuffer
-	// (RetroArch: FBO quad; nextui convention: center via (device-src)/2).
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-	glClearColor(0, 0, 0, 1);
-	glClear(GL_COLOR_BUFFER_BIT);
-
-	int dst_w = (int)width;
-	int dst_h = (int)height;
-	if (dst_w > DEVICE_WIDTH || dst_h > DEVICE_HEIGHT) {
-		double s = fmin((double)DEVICE_WIDTH / dst_w, (double)DEVICE_HEIGHT / dst_h);
-		dst_w = (int)(dst_w * s);
-		dst_h = (int)(dst_h * s);
-	}
-	int dst_x = (DEVICE_WIDTH - dst_w) / 2;
-	int dst_y = (DEVICE_HEIGHT - dst_h) / 2;
-
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, ma_gl_fbo);
-	glBlitFramebuffer(0, 0, (int)width, (int)height,
-			dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
-			GL_COLOR_BUFFER_BIT, GL_LINEAR);
-
-	// Leave the read binding on the default framebuffer so the in-game
-	// menu's GFX_GL_screenCapture (glReadPixels) grabs what is actually on
-	// screen (the presented, centered frame) instead of the 1024x1024 render
-	// FBO - reading that would return the 640x480 content anchored at its
-	// bottom-left, i.e. the game shifted left with an empty band on the right.
-	// Safe for flycast: glsm's next STATE_BIND restores the core's FBO
-	// binding (default_framebuffer == ma_gl_fbo) at the start of retro_run.
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-
+	// Single present path for every orientation (landscape included): the
+	// core renders into the frontend FBO and we present it as a textured
+	// quad -- see ma_gl_present_quad. Landscape previously used
+	// glBlitFramebuffer; it was folded in so rotation, scaling, sharpness,
+	// offsets and core-state management each live in exactly one place.
+	ma_gl_present_quad(width, height);
 	SDL_GL_SwapWindow(win);
 }
 

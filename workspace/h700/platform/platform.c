@@ -1005,6 +1005,16 @@ void PLAT_setNetworkTimeSync(bool on) {
 	system(on ? "timedatectl set-ntp true" : "timedatectl set-ntp false");
 }
 
+// Overscan support (Cropped "Screen Scaling" entry). The generic api.c
+// fallback returns 0, which hides the "Cropped" option (index 4) in the
+// scaling menu (ma_config.c keys it off GFX_supportsOverscan). h700 renders
+// integer-cover crops correctly on both the software and GLES paths, so
+// advertise it. The HDMI fallback to Native is handled by the scalers
+// themselves (ma_video.c:451 / ma_menu.c:1439: DEVICE_WIDTH == HDMI_WIDTH).
+int PLAT_supportsOverscan(void) {
+	return 1;
+}
+
 /////////////////////////
 
 // We use the generic video implementation here
