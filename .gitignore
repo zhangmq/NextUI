@@ -46,3 +46,7 @@ workspace/.container_runtime
 AGENTS.md
 CLAUDE.md
 .worktrees/
+
+# minarch-gl throwaway merge build tree
+/workspace/all/.minarch-gl-build/
+

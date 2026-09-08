@@ -1,0 +1,4 @@
+# Build artifacts (the merge tree lives beside minarch/: ../../.gl-build,
+# ignored in the repository root .gitignore; this file only covers the
+# wrapper's own output copy).
+build/
