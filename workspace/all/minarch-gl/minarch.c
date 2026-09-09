@@ -276,6 +276,11 @@ int main(int argc , char* argv[]) {
 		GFX_startFrame();
 
 		run_frame();
+
+		// RA runloop pacing for hardware-render cores: spend the frame
+		// budget here (the thread calling retro_run), not in the core's
+		// video callback.
+		MA_GL_frame_throttle();
 		
 		// Process RetroAchievements for this frame
 		RA_doFrame();

@@ -34,6 +34,14 @@
 
 static int reloadShaderTextures = 1;
 static int shaderResetRequested = 0;
+// RA FinalViewportSize (shader_glsl.c set_params, params.vp_width/height):
+// the final output viewport of this frame's present, uploaded to every pass
+// of the chain. Set by PLAT_run_shader_pipeline from the present rect.
+static int s_final_vp_w = 0;
+static int s_final_vp_h = 0;
+// Set when the GL window accepts swap-interval vsync (see PLAT_initVideo);
+// drives whether the hw-render present path throttles by usleep or by swap.
+int ma_gl_vsync_active = 0;
 
 static SDL_BlendMode getPremultipliedBlendMode(void) {
 	return SDL_ComposeCustomBlendMode(
@@ -64,6 +72,7 @@ typedef struct ShaderProgram {
 	GLint u_OrigTexture;
 	GLint u_texelSize;
 	GLint u_MVP;
+	GLint u_FinalViewportSize;
 	
 	ShaderParam *pragmas;  // Dynamic array of parsed pragma parameters
 	int num_pragmas;       // Count of valid pragma parameters
@@ -79,6 +88,8 @@ typedef struct ShaderPass {
 	int alpha;
 	GLuint target_texture;
 	int target_updated;
+	int target_w;  // allocated pow2 dims of target_texture (RA fbo_rect w/h)
+	int target_h;
 	int scale;
 	int srctype;
 	int scaletype;
@@ -557,6 +568,7 @@ void init_shader_program(ShaderProgram * shader, const char * path, const char *
 		shader->u_OrigTexture = glGetUniformLocation(shader->shader_p, "OrigTexture");
 		shader->u_texelSize = glGetUniformLocation(shader->shader_p, "texelSize");
 		shader->u_MVP = glGetUniformLocation(shader->shader_p, "MVPMatrix");
+		shader->u_FinalViewportSize = glGetUniformLocation(shader->shader_p, "FinalViewportSize");
 		for (int i = 0; i < shader->num_pragmas; ++i) {
 			shader->pragmas[i].uniformLocation = glGetUniformLocation(shader->shader_p, shader->pragmas[i].name);
 			shader->pragmas[i].value = shader->pragmas[i].def;
@@ -728,6 +740,19 @@ SDL_Surface* PLAT_initVideo(void) {
 	}
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	glViewport(0, 0, w, h);
+
+	// Probe real swap-interval vsync (RA enable_vsync semantics) instead of
+	// assuming the driver cannot vsync. The result is only logged here: the
+	// hw-render present path still uses the usleep throttle until swap-vsync
+	// pacing (incl. fast-forward interplay) is wired up.
+	{
+		int swap_ok = (SDL_GL_SetSwapInterval(1) == 0);
+		if (swap_ok)
+			SDL_GL_SetSwapInterval(0);
+		ma_gl_vsync_active = 0;
+		LOG_info("minarch: GL swap-interval vsync %s\n",
+			swap_ok ? "supported" : "unsupported by driver");
+	}
 
 	vid.stream_layer1 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w,h);
 	vid.target_layer1 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET , w,h);
@@ -1821,7 +1846,15 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
                    int x, int y, int dst_width, int dst_height,
 				   const float mvp[16], int unit_quad) {
 
-	static GLuint static_VAO = 0, static_VBO = 0;
+	// RA gl_glsl_use/set_coords/set_attribs model (shader_glsl.c): NO VAO.
+	// The pipeline draws with the default VAO 0 (= RA's global attrib state
+	// on GLES2) and rebuilds the vertex/texcoord stream + attrib pointers
+	// on every pass. Attribs enabled for a program are disabled again when
+	// the program switches (gl_glsl_reset_attrib), so no array from one
+	// program/VAO leaks into another draw.
+	static GLuint static_VBO = 0;
+	static GLint pass_enabled_locs[8] = { 0 };
+	static int pass_enabled_cnt = 0;
 	static GLuint last_program = 0;
 	static GLfloat texelSize[2] = {-1.0f, -1.0f};
 	static GLuint fbo = 0;
@@ -1860,7 +1893,9 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 
 	if (shaderResetRequested) {
 		// Force rebuild of GL objects and cached state
-		if (static_VAO) { glDeleteVertexArrays(1, &static_VAO); static_VAO = 0; }
+		for (int e = 0; e < pass_enabled_cnt; e++)
+			glDisableVertexAttribArray(pass_enabled_locs[e]);
+		pass_enabled_cnt = 0;
 		if (static_VBO) { glDeleteBuffers(1, &static_VBO); static_VBO = 0; }
 		last_program = 0;
 		texelSize[0] = texelSize[1] = -1.0f;
@@ -1881,74 +1916,65 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	texelSize[0] = 1.0f / shader_pass->texw;
 	texelSize[1] = 1.0f / shader_pass->texh;
 
-	if (shader_program_handle != last_program)
+	if (shader_program_handle != last_program) {
+		// RA gl_glsl_use (shader_glsl.c:1802-1814): before switching
+		// programs, disable the attrib arrays the previous program enabled
+		// (gl_glsl_reset_attrib). Leftover enabled arrays with pointers into
+		// this pipeline's VBO would otherwise be read by later draws that
+		// bind the same VAO 0 / global attrib slots.
+		for (int e = 0; e < pass_enabled_cnt; e++)
+			glDisableVertexAttribArray(pass_enabled_locs[e]);
+		pass_enabled_cnt = 0;
 		glUseProgram(shader_program_handle);
-
-	// Bind the pipeline's own VAO/VBO before ANY attribute setup, on EVERY
-	// pass. RetroArch's GLSL backend does the same on every draw
-	// (gl_glsl_set_attribs: bind vbo -> pointers -> unbind), because other
-	// draws leave their own VAO/ARRAY_BUFFER bound between passes -- the
-	// hw-render normalize quad binds present_vao/present_vbo every frame --
-	// and relying on the residual state froze the chain on its first frame
-	// (the pass strip got clipped away) and corrupted the final pass (the
-	// pointer setup captured the wrong buffer).
-	if (static_VAO == 0) {
-		glGenVertexArrays(1, &static_VAO);
-		glGenBuffers(1, &static_VBO);
-		glBindVertexArray(static_VAO);
-		glBindBuffer(GL_ARRAY_BUFFER, static_VBO);
-
-		float vertices[] = {
-			// x,    y,    z,    w,     u,    v,    s,    t
-			0.0f,  0.0f, 0.0f, 1.0f,  0.0f, 0.0f, 0.0f, 0.0f,  // BL
-			1.0f,  0.0f, 0.0f, 1.0f,  1.0f, 0.0f, 0.0f, 0.0f,  // BR
-			0.0f,  1.0f, 0.0f, 1.0f,  0.0f, 1.0f, 0.0f, 0.0f,  // TL
-			1.0f,  1.0f, 0.0f, 1.0f,  1.0f, 1.0f, 0.0f, 0.0f   // TR
-		};
-
-		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-	} else {
-		glBindVertexArray(static_VAO);
-		glBindBuffer(GL_ARRAY_BUFFER, static_VBO);
 	}
 
+	// RA gl_glsl_set_coords/set_attribs (shader_glsl.c:1709-1800, 701-731):
+	// draw on the default VAO 0 (the GLES3 name for RA's global attrib
+	// state) with one VBO. Stream layout: [texcoord 2f/vertex x4][vertex
+	// 2f/vertex x4]; each attrib is size=2, stride=0, set right before the
+	// draw and ARRAY_BUFFER unbinds immediately after (gl2.c / RA never
+	// rely on a residual binding; binding VAO 0 here also stops pointers
+	// from being captured into whichever VAO another draw left bound).
+	if (static_VBO == 0)
+		glGenBuffers(1, &static_VBO);
+	glBindVertexArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, static_VBO);
+
+	GLfloat stream[16];
 	if (unit_quad) {
 		// RA chain/final geometry: unit quad (gl2.c fbo_vertexes, 0..1)
-		// + source content-region texcoords (xamt/yamt). The pass MVP
-		// maps the quad onto the pass viewport; bottom_left_origin=true
-		// keeps the FBO content bottom-up (v=0 = texture row 0).
-		float quad[32] = {
-			0.f, 0.f, 0.f, 1.f,   0.f, 0.f, 0.f, 0.f,
-			1.f, 0.f, 0.f, 1.f,   uv_w, 0.f, 0.f, 0.f,
-			0.f, 1.f, 0.f, 1.f,   0.f, uv_h, 0.f, 0.f,
-			1.f, 1.f, 0.f, 1.f,   uv_w, uv_h, 0.f, 0.f
-		};
-		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STREAM_DRAW);
+		// + source content-region texcoords (xamt/yamt); bottom_left_origin
+		// keeps the FBO content bottom-up (v=0 = texture row 0). Same
+		// values RA puts in coords->tex_coord / coords->vertex.
+		const GLfloat tex[8]  = { 0.f, 0.f, uv_w, 0.f, 0.f, uv_h, uv_w, uv_h };
+		const GLfloat vert[8] = { 0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f };
+		memcpy(stream, tex, sizeof(tex));
+		memcpy(stream + 8, vert, sizeof(vert));
 	} else {
 		// NextUI-only effect/overlay/notification passes (no RA
 		// equivalent): fullscreen clip-space quad + full texture, exactly
 		// the pre-alignment behavior.
-		float quad[32] = {
-			-1.f,  1.f, 0.f, 1.f,   0.f, 1.f, 0.f, 0.f,  // top-left
-			-1.f, -1.f, 0.f, 1.f,   0.f, 0.f, 0.f, 0.f,  // bottom-left
-			 1.f,  1.f, 0.f, 1.f,   1.f, 1.f, 0.f, 0.f,  // top-right
-			 1.f, -1.f, 0.f, 1.f,   1.f, 0.f, 0.f, 0.f   // bottom-right
-		};
-		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STREAM_DRAW);
+		const GLfloat tex[8]  = { 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f, 0.f };
+		const GLfloat vert[8] = { -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f, -1.f };
+		memcpy(stream, tex, sizeof(tex));
+		memcpy(stream + 8, vert, sizeof(vert));
 	}
+	glBufferData(GL_ARRAY_BUFFER, sizeof(stream), stream, GL_STREAM_DRAW);
 
-	// Attribute pointers are re-established on EVERY pass (RetroArch re-runs
-	// gl_glsl_set_coords per draw); attrib locations are per-program, so
-	// they are queried by name each time.
+	// Attribute locations are per-program, queried by name on every pass
+	// (RA re-runs gl_glsl_set_coords per draw).
 	GLint posAttrib = glGetAttribLocation(shader_program_handle, "VertexCoord");
 	GLint texAttrib = glGetAttribLocation(shader_program_handle, "TexCoord");
-	if (posAttrib >= 0) {
-		glVertexAttribPointer(posAttrib, 4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+	if (posAttrib >= 0 && pass_enabled_cnt < 8) {
+		glVertexAttribPointer(posAttrib, 2, GL_FLOAT, GL_FALSE, 0,
+				(const GLvoid*)(8 * sizeof(GLfloat)));
 		glEnableVertexAttribArray(posAttrib);
+		pass_enabled_locs[pass_enabled_cnt++] = posAttrib;
 	}
-	if (texAttrib >= 0) {
-		glVertexAttribPointer(texAttrib,  4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(4 * sizeof(float)));
+	if (texAttrib >= 0 && pass_enabled_cnt < 8) {
+		glVertexAttribPointer(texAttrib, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid*)0);
 		glEnableVertexAttribArray(texAttrib);
+		pass_enabled_locs[pass_enabled_cnt++] = texAttrib;
 	}
 	// RetroArch unbinds ARRAY_BUFFER right after capturing the pointers, so
 	// a later bind by another draw cannot affect this pipeline's state.
@@ -1964,6 +1990,10 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	if (shader_program->u_InputSize >= 0) glUniform2f(shader_program->u_InputSize, shader_pass->srcw, shader_pass->srch);
 	if (shader_program->u_OrigTextureSize >= 0) glUniform2f(shader_program->u_OrigTextureSize, origtex_w, origtex_h);
 	if (shader_program->u_OrigInputSize >= 0) glUniform2f(shader_program->u_OrigInputSize, orig_w, orig_h);
+	if (shader_program->u_FinalViewportSize >= 0)
+		glUniform2f(shader_program->u_FinalViewportSize,
+				(float)(s_final_vp_w > 0 ? s_final_vp_w : dst_width),
+				(float)(s_final_vp_h > 0 ? s_final_vp_h : dst_height));
 	for (int i = 0; i < shader_program->num_pragmas; ++i) {
 		glUniform1f(shader_program->pragmas[i].uniformLocation, shader_program->pragmas[i].value);
 	}
@@ -1976,7 +2006,19 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 			*target_texture = 0;
 			shader_pass->target_updated = 1;
 		}
-		if (*target_texture==0 || shader_pass->target_updated || reloadShaderTextures) {
+		// RA gl2_frame resize handling (gl2.c:4099-4157): pass FBO textures
+		// are recreated whenever the pass content outgrows the current pow2
+		// allocation -- checked every frame, not only on explicit reloads,
+		// because the core's reported frame size can change mid-stream (the
+		// 853x480 startup estimate -> 640x238 -> 640x480 transitions). A
+		// 640x238 frame reallocates to pow2 1024x256; the following
+		// 640x480 frame would then render past the texture without this
+		// grow check.
+		unsigned tw = gl_next_pow2(dst_width);
+		unsigned th = gl_next_pow2(dst_height);
+		if (*target_texture==0 || shader_pass->target_updated || reloadShaderTextures
+				|| tw > (unsigned)shader_pass->target_w
+				|| th > (unsigned)shader_pass->target_h) {
 			if(*target_texture==0)
 				glGenTextures(1, target_texture);
 			glActiveTexture(GL_TEXTURE0);
@@ -1990,8 +2032,10 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 			// occupies the bottom-left [0..dst] region, like the
 			// hw-render source FBO.
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-					gl_next_pow2(dst_width), gl_next_pow2(dst_height),
+					tw, th,
 					0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			shader_pass->target_w = (int)tw;
+			shader_pass->target_h = (int)th;
 			shader_pass->target_updated = 0;
 		}
 		if (fbo == 0) {
@@ -2050,6 +2094,38 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 		glUniform2fv(shader_program->u_texelSize, 1, texelSize);
 	}
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	// DIAG(pass-state): first 3 draws + every 600th: object validity, FBO
+	// status, GL error right after the draw. TEMPORARY -- remove with the
+	// other dumps.
+	{
+		static int pdiag = 0;
+		pdiag++;
+		if (pdiag <= 3 || (pdiag % 120) == 1) {
+			GLenum perr = glGetError();
+			GLint pfs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+			GLint pvp[4] = {0};
+			GLint pcm[4] = {1,1,1,1};
+			GLint pbind[3] = {-1,-1,-1};
+			glGetIntegerv(GL_VIEWPORT, pvp);
+			glGetIntegerv(GL_COLOR_WRITEMASK, pcm);
+			glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &pbind[0]);
+			glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &pbind[1]);
+			glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &pbind[2]);
+			LOG_info("PASSDIAG #%d prog=%u(%s) src=%u srcIsTex=%d tgt=%u "
+					"tgtIsTex=%d fbo=%u fbStatus=0x%x err=0x%x vp=%d,%d "
+					"%dx%d mvp=%s va=%d/%d mask=%d%d%d%d buf=%d/%d/%d\n",
+				pdiag, (unsigned)shader_program_handle,
+				shader_program->filename ? shader_program->filename : "?",
+				(unsigned)src_texture, (int)glIsTexture(src_texture),
+				target_texture ? (unsigned)*target_texture : 0,
+				target_texture ? (int)glIsTexture(*target_texture) : -1,
+				(unsigned)fbo, (unsigned)pfs,
+				(unsigned)perr, pvp[0], pvp[1], pvp[2], pvp[3],
+				mvp ? "set" : "null",
+				posAttrib, texAttrib, pcm[0], pcm[1], pcm[2], pcm[3],
+				pbind[0], pbind[1], pbind[2]);
+		}
+	}
 	last_program = shader_program_handle;
 }
 
@@ -2075,6 +2151,9 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 	// frame texture (tex == content).
 	orig_w = frame_w; orig_h = frame_h;
 	origtex_w = (int)src_tex_w; origtex_h = (int)src_tex_h;
+	// FinalViewportSize uniform: the present rect, constant for all passes.
+	s_final_vp_w = dst_w;
+	s_final_vp_h = dst_h;
 
 	for (int i = 0; i < nrofshaders; i++) {
 		int src_w = last_w;
@@ -2132,12 +2211,12 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 			// ~10 s at 60 fps; the hw path never advances frame_count
 			// (that only happens in the software present), so this dump
 			// uses its own cadence.
-			if (i == 0 && (p0d % 600) == 1) {
+			if (i == 0 && (p0d % 120) == 1) {
 				GLint pfbo = 0;
 				char path[128];
 				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
 				snprintf(path, sizeof(path), "/tmp/dump_pass0_%03d.rgb",
-						p0d / 600 + 1);
+						p0d / 120 + 1);
 				unsigned pw = gl_next_pow2(pass_dst_w);
 				unsigned ph = gl_next_pow2(pass_dst_h);
 				FILE *f = fopen(path, "wb");

@@ -38,6 +38,10 @@ void MA_GL_context_destroy(void);
 // Presents the GL framebuffer the core rendered into.
 void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size_t pitch);
 
+// Main-loop frame pacing for the hw-render path (call once per runloop
+// iteration; does nothing when no hw-render core is active).
+void MA_GL_frame_throttle(void);
+
 // Handles RETRO_ENVIRONMENT_SET_ROTATION (0-3, multiples of 90 degrees).
 // RetroArch convention: the core renders the image already oriented for the
 // given rotation and the frontend must rotate its output to display it

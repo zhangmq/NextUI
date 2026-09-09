@@ -218,7 +218,6 @@ void MA_GL_update_fbo_size(void) {
 
 static unsigned ma_gl_rotation = 0;   // 0-3, from SET_ROTATION (0 = no rotation)
 static GLuint ma_gl_present_prog = 0;
-static GLuint ma_gl_present_vao = 0;
 static GLuint ma_gl_present_vbo = 0;
 static GLint  ma_gl_present_mvp_loc = -1;
 static GLint  ma_gl_present_tex_loc = -1; // sampler uniform (RA set_params: glUniform1i)
@@ -292,58 +291,16 @@ static bool ma_gl_present_init(void) {
 	// rely on the GLSL default.
 	ma_gl_present_tex_loc = glGetUniformLocation(ma_gl_present_prog, "uTex");
 
-	// One VAO + one interleaved VBO (x,y,u,v per vertex), re-uploaded each
-	// frame (128 bytes - negligible). Own VAO keeps the attrib setup away
-	// from the core's VAOs.
-	glGenVertexArrays(1, &ma_gl_present_vao);
-	glBindVertexArray(ma_gl_present_vao);
+	// RA gl_glsl_set_coords/set_attribs model (shader_glsl.c:701-731, 1709):
+	// one VBO, re-uploaded every draw, attributes size=2/stride=0 on the
+	// DEFAULT VAO (VAO 0 == RA's global attrib state) -- no private VAO.
 	glGenBuffers(1, &ma_gl_present_vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
-	// RA gl_glsl_set_coords buffer layout: vertices first (2 floats each),
-	// then texcoords (2 floats each) -- NOT interleaved.
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void*)0);
-	glEnableVertexAttribArray(0);
-	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, (void*)(8 * sizeof(GLfloat)));
-	glEnableVertexAttribArray(1);
-	glBindVertexArray(0);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-	LOG_info("minarch: present quad pipeline ready (prog=%u vao=%u vbo=%u)\n",
-		(unsigned)ma_gl_present_prog, (unsigned)ma_gl_present_vao,
-		(unsigned)ma_gl_present_vbo);
+	LOG_info("minarch: present quad pipeline ready (prog=%u vbo=%u)\n",
+		(unsigned)ma_gl_present_prog, (unsigned)ma_gl_present_vbo);
 	return true;
-}
-
-// Reset every GL state flycast's glcache tracks to values that make its
-// cache skips harmless for the next core frame. flycast's GLES2 renderer
-// (gles/gldraw.cpp) enables GL_STENCIL_TEST at the start of every draw list
-// and never disables it, and typically ends frames with the translucent list
-// (GL_BLEND enabled, SrcBlend/DstBlend = SRC_ALPHA/ONE_MINUS_SRC_ALPHA is the
-// PVR default), so leaving stencil+blend ENABLED with those funcs means the
-// per-draw Enable()/BlendFunc() cache hits are no-ops that match reality.
-// Everything else is left in the disabled/default state flycast's frame-start
-// code (RenderFrame) re-establishes anyway.
-static void ma_gl_reset_core_state(void) {
-	glEnable(GL_STENCIL_TEST);
-	glEnable(GL_BLEND);
-	glDisable(GL_SCISSOR_TEST);
-	glDisable(GL_DEPTH_TEST);
-	glDisable(GL_CULL_FACE);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glStencilFunc(GL_ALWAYS, 0, 0);
-	glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-	glStencilMask(0xFF);
-	glDepthFunc(GL_LESS);
-	glDepthMask(GL_TRUE);
-	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-	glCullFace(GL_BACK);
-	glFrontFace(GL_CCW);
-	glClearColor(0.f, 0.f, 0.f, 1.f);
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-	glUseProgram(0);
-	glBindTexture(GL_TEXTURE_2D, 0);
-	glBindVertexArray(0);
-	glActiveTexture(GL_TEXTURE0);
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +475,24 @@ static void ma_gl_compute_present_rect(int width, int height,
 // apply in one place. Performance is equivalent: a scaling blit on Mali is
 // internally a sampling draw, same as this quad.
 
+// RA gl_glsl_set_coords/set_attribs (shader_glsl.c:701-731, 1709-1800):
+// upload the [vertex 2f x4][texcoord 2f x4] stream into the shared VBO and
+// set both attributes (size=2, stride=0) on the DEFAULT VAO (VAO 0 = RA's
+// global attrib state) right before the draw. Caller must have the present
+// program current; attrib locations are 0=aPos/1=aTex (glBindAttribLocation).
+static void ma_gl_present_draw(const GLfloat *coords) {
+	glBindVertexArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
+	glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(GLfloat), coords, GL_STREAM_DRAW);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid*)0);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0,
+			(const GLvoid*)(8 * sizeof(GLfloat)));
+	glEnableVertexAttribArray(1);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 // Draw a passthrough quad for the Screen Effect / Overlay textures. Unlike
 // the FBO texture (content anchored at its GL bottom-left, v up), these RGBA
 // surfaces have row 0 at the TOP, so v runs top-down on screen; UVs span the
@@ -536,14 +511,13 @@ static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
 		cx0, cy0,  cx1, cy0,  cx0, cy1,  cx1, cy1,   // vertex
 		0.f, 1.f,  1.f, 1.f,  0.f, 0.f,  1.f, 0.f,   // texcoord
 	};
-	glBufferData(GL_ARRAY_BUFFER, sizeof(coords), coords, GL_STREAM_DRAW);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, tex);
 	// Same filter the software path sets on these textures (generic_video.c
 	// upload block): NEAREST.
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	ma_gl_present_draw(coords);
 }
 
 static void ma_gl_present_quad(unsigned width, unsigned height) {
@@ -569,7 +543,7 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	{
 		static int rl = 0;
 		rl++;
-		int r_every = (core.fps > 1.0) ? (int)(core.fps * 10) : 600;
+		int r_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
 		if (r_every < 1) r_every = 1;
 		if (rl % r_every == 1)
 			LOG_info("RECT frame=%ux%u disp=%ux%u rot=%u rect=%d,%d %ux%u dev=%dx%d scale=%d aspect=%.4f\n",
@@ -625,7 +599,7 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	{
 		static int qdump = 0;
 		qdump++;
-		int q_every = (core.fps > 1.0) ? (int)(core.fps * 10) : 600;
+		int q_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
 		if (q_every < 1) q_every = 1;
 		if (qdump % q_every == 1) {
 			FILE *pf = fopen("/tmp/dump_quad_params.txt", "w");
@@ -657,16 +631,16 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// in-game menu's GFX_GL_screenCapture (glReadPixels) reads the READ
 	// binding and must see the PRESENTED frame, not the 1024x1024 render
 	// FBO (that would give the 640x480 content anchored bottom-left, game
-	// shifted left with an empty band). ma_gl_reset_core_state does not
-	// touch bindings; glsm's next STATE_BIND restores the core's FBO
+	// shifted left with an empty band). This does not touch bindings;
+	// glsm's next STATE_BIND restores the core's FBO
 	// (default_framebuffer == ma_gl_fbo) at the start of retro_run.
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	// RA gl2_set_viewport: viewport = the aspect-fit pixel rect (unit quad +
 	// ortho MVP map into it). Fullscreen only implicitly for full coverage.
 	glViewport(dst_x, dst_y, dst_w, dst_h);
-	// State resets BEFORE the clear (scissor: flycast leaves its own
-	// render window enabled at frame end -- see ma_gl_reset_core_state).
-	// RA gl2_renderchain_restore_default_state (GLES branch, gl2.c:2468):
+	// State resets BEFORE the clear (scissor: flycast can leave its own
+	// render window enabled at frame end). RA
+	// gl2_renderchain_restore_default_state (GLES branch, gl2.c:2468):
 	// glDisable(DEPTH_TEST|CULL_FACE|DITHER); the remaining resets below
 	// mirror gl2.c:4217-4222 (scissor/stencil/blend + blend funcs + clear
 	// color).
@@ -705,7 +679,7 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		{
 			static int ds = 0;
 			ds++;
-			int q_every = (core.fps > 1.0) ? (int)(core.fps * 10) : 600;
+			int q_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
 			if (q_every < 1) q_every = 1;
 			if (ds % q_every == 1) {
 				GLint pfbo = 0;
@@ -749,9 +723,6 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		// RA set_params: sampler bound to unit 1 explicitly (texunit starts at 1).
 		if (ma_gl_present_tex_loc >= 0)
 			glUniform1i(ma_gl_present_tex_loc, 1);
-		glBindVertexArray(ma_gl_present_vao);
-		glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(coords), coords, GL_STREAM_DRAW);
 		glActiveTexture(GL_TEXTURE1);
 		// Dual-buffer present (RA gl2 semantics): sample the COMPLETED slot,
 		// never the one the core rendered into this frame. RA set_params
@@ -765,15 +736,14 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
 				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
-		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		ma_gl_present_draw(coords);
 		// DIAG(dump): capture the quad output AT THE DRAW SITE -- right
-		// after glDrawArrays, before ANY teardown (no reset_core_state, no
-		// overlay, no swap). Read FBO 0 (the quad's target) in full.
-		// TEMPORARY.
+		// after the draw, before ANY teardown (no overlay, no swap). Read
+		// FBO 0 (the quad's target) in full. TEMPORARY.
 		{
 			static int dumpq = 0;
 			dumpq++;
-			int q_every = (core.fps > 1.0) ? (int)(core.fps * 10) : 600;
+			int q_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
 			if (q_every < 1) q_every = 1;
 			if (dumpq % q_every == 1) {
 				GLint pfbo = 0;
@@ -816,8 +786,7 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// here, same draw order: game -> effect -> overlay). The effect
 	// anchors at the game rect with its own size; the overlay is
 	// fullscreen. Both are RGBA with alpha, so blending is on for these
-	// two draws (ma_gl_reset_core_state leaves it in the state flycast
-	// expects). The effect PNG density follows the integer scale the
+	// two draws. The effect PNG density follows the integer scale the
 	// software scaler would report, derived here from the present rect.
 	int fx_scale_w = dst_w / (width ? (int)width : 1);
 	int fx_scale_h = dst_h / (height ? (int)height : 1);
@@ -825,13 +794,12 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (fx_scale < 1) fx_scale = 1;
 	GFX_setEffectScale(fx_scale);
 	GFX_prepare_overlay_textures();
-	// The shader chain runs on its own program/VAO, leaves the viewport at
-	// the final pass's rect, and may leave TEXTURE1 bound; re-establish the
-	// present program's state (fullscreen viewport, no scissor) before
-	// overlaying.
+	// The shader chain runs on its own program (VAO 0 global attribs) and
+	// leaves the viewport at the final pass's rect, and may leave TEXTURE1
+	// bound; re-establish the present program's state (fullscreen viewport,
+	// no scissor) before overlaying. ma_gl_present_draw re-uploads the quad
+	// and attributes on the default VAO.
 	glUseProgram(ma_gl_present_prog);
-	glBindVertexArray(ma_gl_present_vao);
-	glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
 	glDisable(GL_SCISSOR_TEST);
 	glActiveTexture(GL_TEXTURE1);
@@ -848,9 +816,6 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		if (ov_tex && ov_w > 0 && ov_h > 0)
 			ma_gl_draw_overlay_quad(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, ov_tex);
 	}
-
-	// Leave the state flycast's glcache expects (see ma_gl_reset_core_state).
-	ma_gl_reset_core_state();
 }
 
 void MA_GL_set_rotation(unsigned rotation) {
@@ -898,6 +863,16 @@ static void ma_gl_throttle(double fps) {
 		frame_index = -1;
 		last_fps = 0.0;
 	}
+}
+
+// RA runloop pacing for the hw-render path: the frame budget is applied on
+// the main loop (the thread that drives retro_run), never inside the core's
+// video callback (which runs on the core's render thread -- sleeping there
+// throttles the core itself). The video callback presents without sleeping;
+// the main loop calls this once per frame.
+void MA_GL_frame_throttle(void) {
+	if (!hw_render_active) return;
+	ma_gl_throttle(core.fps);
 }
 
 bool MA_GL_set_hw_render(struct retro_hw_render_callback *cb) {
@@ -1028,10 +1003,6 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	SDL_GLContext ctx = PLAT_getGLContext();
 	if (!win || !ctx) return;
 
-	// Align the present to the core's frame rate (RetroArch convention for
-	// frontends without vsync). Do it before MakeCurrent/Swap.
-	ma_gl_throttle(core.fps);
-
 	SDL_GL_MakeCurrent(win, ctx);
 
 	// DIAG(stage-D): FBO1 content check before present. TEMPORARY.
@@ -1132,8 +1103,6 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		glClear(GL_COLOR_BUFFER_BIT);
 
 		glUseProgram(ma_gl_present_prog);
-		glBindVertexArray(ma_gl_present_vao);
-		glBindBuffer(GL_ARRAY_BUFFER, ma_gl_present_vbo);
 		// Full-screen quad (RA unit vertexes + ortho MVP), UVs map the
 		// content region of the RA-sized FBO.
 		float tw = (float)width / ma_gl_fbo_dim_cur;
@@ -1142,7 +1111,6 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 			0.f, 0.f,  1.f, 0.f,  0.f, 1.f,  1.f, 1.f,   // vertex
 			0.f, 0.f,  tw,  0.f,  0.f, th,   tw,  th,    // texcoord
 		};
-		glBufferData(GL_ARRAY_BUFFER, sizeof(coords), coords, GL_STREAM_DRAW);
 		if (ma_gl_present_mvp_loc >= 0) {
 			static const float ortho[16] = {
 				2.f, 0.f, 0.f, 0.f,
@@ -1160,7 +1128,7 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		ma_gl_present_draw(coords);
 		SDL_GL_SwapWindow(win);
 	} else {
 		// Single present path for every orientation (landscape included): the
@@ -1174,7 +1142,7 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		{
 			static int dumpf = 0;
 			dumpf++;
-			int dump_every = (core.fps > 1.0) ? (int)(core.fps * 10) : 600;
+			int dump_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
 			if (dump_every < 1) dump_every = 1;
 			if (dumpf % dump_every == 1) {
 				GLint pfbo = 0;
