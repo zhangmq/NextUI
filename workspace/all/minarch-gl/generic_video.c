@@ -319,6 +319,22 @@ char* load_shader_source(const char* filename) {
     return source;
 }
 
+// FNV-1a 32-bit over the shader source. RA has no persistent program-binary
+// cache: a pass program is (re)built from the current .glsl source on every
+// (re)load, so the compiled program always matches the file on disk. The
+// disk cache below must therefore be keyed by content, not by file name --
+// a bare name would resurrect a stale binary for a replaced source (e.g.
+// the MVP-ified system shaders) and silently run the old program.
+static unsigned shader_source_hash(const char *s) {
+	unsigned h = 2166136261u;
+	if (!s) return h;
+	while (*s) {
+		h ^= (unsigned char)*s++;
+		h *= 16777619u;
+	}
+	return h;
+}
+
 GLuint load_shader_from_file(GLenum type, const char* filepath) {
     char* source = load_shader_source(filepath);
     if (!source) return 0;
@@ -508,7 +524,12 @@ void init_shader_program(ShaderProgram * shader, const char * path, const char *
 		LOG_info("Deleting previous shader %i\n",shader->shader_p);
 		glDeleteProgram(shader->shader_p);
 	}
-	shader->shader_p = link_program(vertex_shader1, fragment_shader1, filename);
+	// Cache key carries a content hash so a changed .glsl invalidates its
+	// cached binary (see shader_source_hash).
+	char cache_key[320];
+	snprintf(cache_key, sizeof(cache_key), "%s-%08x", filename,
+			shader_source_hash(shaderSource));
+	shader->shader_p = link_program(vertex_shader1, fragment_shader1, cache_key);
 
 
 	if (shader->shader_p == 0) {
@@ -2105,35 +2126,42 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 		// DIAG(dump): the first chain pass output (pass-0 FBO), read back
 		// in render convention right after the pass (the FBO is still
 		// bound). TEMPORARY -- remove with the other dumps.
-		if (i == 0 && (frame_count % 600) == 7) {
-			GLint pfbo = 0;
-			char path[128];
-			glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
-			snprintf(path, sizeof(path), "/tmp/dump_pass0_%03d.rgb",
-					(unsigned)((frame_count / 600) % 1000));
-			unsigned pw = gl_next_pow2(pass_dst_w);
-			unsigned ph = gl_next_pow2(pass_dst_h);
-			FILE *f = fopen(path, "wb");
-			if (f) {
-				unsigned char *buf = malloc((size_t)pw * ph * 3);
-				unsigned char *rgba = malloc((size_t)pw * ph * 4);
-				glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-				for (unsigned y = 0; y < ph; y++) {
-					unsigned char *row = rgba + (size_t)y * pw * 4;
-					for (unsigned x = 0; x < pw; x++) {
-						buf[(size_t)y * pw * 3 + x * 3]     = row[x * 4];
-						buf[(size_t)y * pw * 3 + x * 3 + 1] = row[x * 4 + 1];
-						buf[(size_t)y * pw * 3 + x * 3 + 2] = row[x * 4 + 2];
+		{
+			static int p0d = 0;
+			p0d++;
+			// ~10 s at 60 fps; the hw path never advances frame_count
+			// (that only happens in the software present), so this dump
+			// uses its own cadence.
+			if (i == 0 && (p0d % 600) == 1) {
+				GLint pfbo = 0;
+				char path[128];
+				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
+				snprintf(path, sizeof(path), "/tmp/dump_pass0_%03d.rgb",
+						p0d / 600 + 1);
+				unsigned pw = gl_next_pow2(pass_dst_w);
+				unsigned ph = gl_next_pow2(pass_dst_h);
+				FILE *f = fopen(path, "wb");
+				if (f) {
+					unsigned char *buf = malloc((size_t)pw * ph * 3);
+					unsigned char *rgba = malloc((size_t)pw * ph * 4);
+					glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+					for (unsigned y = 0; y < ph; y++) {
+						unsigned char *row = rgba + (size_t)y * pw * 4;
+						for (unsigned x = 0; x < pw; x++) {
+							buf[(size_t)y * pw * 3 + x * 3]     = row[x * 4];
+							buf[(size_t)y * pw * 3 + x * 3 + 1] = row[x * 4 + 1];
+							buf[(size_t)y * pw * 3 + x * 3 + 2] = row[x * 4 + 2];
+						}
 					}
+					fwrite(buf, 1, (size_t)pw * ph * 3, f);
+					free(rgba);
+					free(buf);
+					fclose(f);
+					LOG_info("DUMPPASS0 %s (%ux%u fbo=%d src=%ux%u)\n", path,
+							pw, ph, pfbo, src_w, src_h);
 				}
-				fwrite(buf, 1, (size_t)pw * ph * 3, f);
-				free(rgba);
-				free(buf);
-				fclose(f);
-				LOG_info("DUMPPASS0 %s (%ux%u fbo=%d src=%ux%u)\n", path,
-						pw, ph, pfbo, src_w, src_h);
+				glBindFramebuffer(GL_FRAMEBUFFER, pfbo);
 			}
-			glBindFramebuffer(GL_FRAMEBUFFER, pfbo);
 		}
 
 		last_w = pass_dst_w;
