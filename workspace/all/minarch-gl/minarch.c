@@ -41,7 +41,7 @@ int cfg_screeny = 64;
 int overlay = 0; 
 int use_core_fps = 0;
 int sync_ref = 0;
-int show_debug = 0;
+volatile int show_debug = 0;
 int max_ff_speed = 3; // 4x
 int ff_audio = 0;
 int fast_forward = 0;
@@ -270,6 +270,33 @@ int main(int argc , char* argv[]) {
 		// budget here (the thread calling retro_run), not in the core's
 		// video callback.
 		MA_GL_frame_throttle();
+
+		// GL hw-render path: the software present functions
+		// (GFX_flip/GFX_GL_Swap/GFX_flip_fixed_rate) that own the
+		// per-frame statistics never run for hw-render cores (their video
+		// callback presents straight from MA_GL_video_refresh), so sample
+		// the shared statistics here once per retro_run instead --
+		// core-paced, same single source of truth as the software paths.
+		if (MA_GL_is_active())
+			GFX_frameStats_tick(core.fps);
+
+		// CPU/GPU telemetry for the debug HUD: the software path reads the
+		// sysfs-backed PLAT_get* fields inside drawDebugHud, which never
+		// runs for hw-render cores. Poll them on this (main) thread -- not
+		// on the core's render thread -- once per frame while the HUD is
+		// shown. perf.cpu_usage is fed by the separate CPU monitor thread
+		// (updateCPUMonitor), enabled together with show_debug.
+		if (show_debug && MA_GL_is_active()) {
+			PLAT_getCPUTemp();
+			PLAT_getCPUSpeed();
+			PLAT_getGPUTemp();
+			PLAT_getGPUSpeed();
+			// GL hw-render debug HUD text: rasterize on the main thread
+			// (SDL_ttf is used by the notification/menu code there and is
+			// not thread-safe); the video-callback thread only uploads the
+			// pixels and draws them.
+			MA_GL_hud_update();
+		}
 		
 		// Process RetroAchievements for this frame
 		RA_doFrame();

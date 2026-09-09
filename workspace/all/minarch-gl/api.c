@@ -756,44 +756,44 @@ void GFX_setAmbientColor(const void *data, unsigned width, unsigned height, size
 	}
 }
 
-void GFX_flip(SDL_Surface *screen)
+// Single source of truth for the per-output-frame statistics that feed the
+// debug HUD (perf.fps / avg_frame_ms / max_frame_ms / frame_drops / jitter
+// and current_fps). Every present path -- software GFX_flip / GFX_GL_Swap /
+// GFX_flip_fixed_rate and the GL hw-render path (GFX_frameStats_tick, called
+// right after its swap) -- samples exactly once per presented frame here.
+// target_fps: the pacing target (drops/jitter are measured against it; the
+// pre-100-frame warm-up reports it instead of an empty average).
+// clamp_to_target: software screen-rate paths clamp absurd frame times to
+// the target so one stalled frame does not drag the rolling average; the
+// core-paced paths (fixed_rate, hw-render) keep the true sample.
+static void frame_stats_sample(double target_fps, int clamp_to_target)
 {
-	{
-		uint64_t performance_frequency = SDL_GetPerformanceFrequency();
-		uint64_t frame_duration = SDL_GetPerformanceCounter() - per_frame_start;
-		double elapsed_time_s = (double)frame_duration / performance_frequency;
-		double frame_ms = elapsed_time_s * 1000.0;
-		//LOG_info("GFX_flip: Frame time before flip: %.2f ms\n", frame_ms);
-	}
-	PLAT_flip(screen, 0);
-
-	perf.fps = current_fps;
-	fps_counter++;
+	if (target_fps <= 0.0)
+		target_fps = SCREEN_FPS;
 
 	uint64_t performance_frequency = SDL_GetPerformanceFrequency();
-	uint64_t frame_duration = SDL_GetPerformanceCounter() - per_frame_start;
-	double elapsed_time_s = (double)frame_duration / performance_frequency;
+	double elapsed_time_s = (double)(SDL_GetPerformanceCounter() - per_frame_start) / performance_frequency;
 	double tempfps = 1.0 / elapsed_time_s;
 
 	// Stats logic
 	double frame_ms = elapsed_time_s * 1000.0;
-	double target_ms = 1000.0 / SCREEN_FPS;
+	double target_ms = 1000.0 / target_fps;
 	perf.jitter = fabs(frame_ms - target_ms);
-	
+
 	if (frame_ms > target_ms * 1.1) {
 		perf.frame_drops++;
-		//LOG_warn("GFX_flip: Frame drop detected! Frame time: %.2f ms (target: %.2f ms)\n", frame_ms, target_ms);
 	}
 
-	if (tempfps < SCREEN_FPS * 0.8 || tempfps > SCREEN_FPS * 1.2)
-		tempfps = SCREEN_FPS;
+	if (clamp_to_target &&
+			(tempfps < target_fps * 0.8 || tempfps > target_fps * 1.2))
+		tempfps = target_fps;
 
 	fps_buffer[fps_buffer_index] = tempfps;
 	frame_time_buffer[fps_buffer_index] = frame_ms;
 	fps_buffer_index = (fps_buffer_index + 1) % FPS_BUFFER_SIZE;
 	// give it a little bit to stabilize and then use, meanwhile the buffer will
 	// cover it
-	if (fps_counter > 100)
+	if (fps_counter++ > 100)
 	{
 		double average_fps = 0.0;
 		double avg_ft = 0.0;
@@ -808,11 +808,39 @@ void GFX_flip(SDL_Surface *screen)
 		average_fps /= fpsbuffersize;
 		avg_ft /= fpsbuffersize;
 		current_fps = average_fps;
+		perf.fps = current_fps;
 		perf.avg_frame_ms = avg_ft;
 		perf.max_frame_ms = max_ft;
 	}
-
+	else
+	{
+		current_fps = target_fps;
+		perf.fps = target_fps;
+		perf.avg_frame_ms = 1000.0 / target_fps;
+		perf.max_frame_ms = perf.avg_frame_ms;
+	}
 	per_frame_start = SDL_GetPerformanceCounter();
+}
+
+// hw-render present path statistics: core-paced, no clamping (a true sample
+// even when the core falls behind), same semantics as GFX_flip_fixed_rate.
+void GFX_frameStats_tick(double target_fps)
+{
+	frame_stats_sample(target_fps, 0);
+}
+
+void GFX_flip(SDL_Surface *screen)
+{
+	{
+		uint64_t performance_frequency = SDL_GetPerformanceFrequency();
+		uint64_t frame_duration = SDL_GetPerformanceCounter() - per_frame_start;
+		double elapsed_time_s = (double)frame_duration / performance_frequency;
+		double frame_ms = elapsed_time_s * 1000.0;
+		//LOG_info("GFX_flip: Frame time before flip: %.2f ms\n", frame_ms);
+	}
+	PLAT_flip(screen, 0);
+
+	frame_stats_sample(SCREEN_FPS, 1);
 }
 void GFX_GL_Swap()
 {
@@ -825,52 +853,7 @@ void GFX_GL_Swap()
 	}
 	PLAT_GL_Swap();
 
-	perf.fps = current_fps;
-	fps_counter++;
-
-	uint64_t performance_frequency = SDL_GetPerformanceFrequency();
-	uint64_t frame_duration = SDL_GetPerformanceCounter() - per_frame_start;
-	double elapsed_time_s = (double)frame_duration / performance_frequency;
-	double tempfps = 1.0 / elapsed_time_s;
-
-	// Stats logic
-	double frame_ms = elapsed_time_s * 1000.0;
-	double target_ms = 1000.0 / SCREEN_FPS;
-	perf.jitter = fabs(frame_ms - target_ms);
-	
-	if (frame_ms > target_ms * 1.1) {
-		perf.frame_drops++;
-		//LOG_warn("GFX_GL_Swap: Frame drop detected! Frame time: %.2f ms (target: %.2f ms)\n", frame_ms, target_ms);
-	}
-
-	if (tempfps < SCREEN_FPS * 0.8 || tempfps > SCREEN_FPS * 1.2)
-		tempfps = SCREEN_FPS;
-
-	fps_buffer[fps_buffer_index] = tempfps;
-	frame_time_buffer[fps_buffer_index] = frame_ms;
-	fps_buffer_index = (fps_buffer_index + 1) % FPS_BUFFER_SIZE;
-	// give it a little bit to stabilize and then use, meanwhile the buffer will
-	// cover it
-	if (fps_counter > 100)
-	{
-		double average_fps = 0.0;
-		double avg_ft = 0.0;
-		double max_ft = 0.0;
-		int fpsbuffersize = MIN(fps_counter, FPS_BUFFER_SIZE);
-		for (int i = 0; i < fpsbuffersize; i++)
-		{
-			average_fps += fps_buffer[i];
-			avg_ft += frame_time_buffer[i];
-			if (frame_time_buffer[i] > max_ft) max_ft = frame_time_buffer[i];
-		}
-		average_fps /= fpsbuffersize;
-		avg_ft /= fpsbuffersize;
-		current_fps = average_fps;
-		perf.avg_frame_ms = avg_ft;
-		perf.max_frame_ms = max_ft;
-	}
-
-	per_frame_start = SDL_GetPerformanceCounter();
+	frame_stats_sample(SCREEN_FPS, 1);
 }
 // eventually this function should be removed as its only here because of all the audio buffer based delay stuff
 void GFX_sync(void)
@@ -961,51 +944,7 @@ void GFX_flip_fixed_rate(SDL_Surface *screen, double target_fps)
 	}
 	PLAT_GL_Swap();
 
-	double elapsed_time_s = (double)(SDL_GetPerformanceCounter() - per_frame_start) / perf_freq;
-	double tempfps = 1.0 / elapsed_time_s;
-
-	// Stats logic
-	double frame_ms = elapsed_time_s * 1000.0;
-	double target_ms = 1000.0 / target_fps;
-	perf.jitter = fabs(frame_ms - target_ms);
-	
-	if (frame_ms > target_ms * 1.1) {
-		perf.frame_drops++;
-		//LOG_warn("GFX_flip_fixed_rate: Frame drop detected! Frame time: %.2f ms (target: %.2f ms)\n", frame_ms, target_ms);
-	}
-
-	fps_buffer[fps_buffer_index] = tempfps;
-	frame_time_buffer[fps_buffer_index] = frame_ms;
-	fps_buffer_index = (fps_buffer_index + 1) % FPS_BUFFER_SIZE;
-	// give it a little bit to stabilize and then use, meanwhile the buffer will
-	// cover it
-	if (fps_counter++ > 100)
-	{
-		double average_fps = 0.0;
-		double avg_ft = 0.0;
-		double max_ft = 0.0;
-		int fpsbuffersize = MIN(fps_counter, FPS_BUFFER_SIZE);
-		for (int i = 0; i < fpsbuffersize; i++)
-		{
-			average_fps += fps_buffer[i];
-			avg_ft += frame_time_buffer[i];
-			if (frame_time_buffer[i] > max_ft) max_ft = frame_time_buffer[i];
-		}
-		average_fps /= fpsbuffersize;
-		avg_ft /= fpsbuffersize;
-		current_fps = average_fps;
-		perf.fps = current_fps;
-		perf.avg_frame_ms = avg_ft;
-		perf.max_frame_ms = max_ft;
-	}
-	else
-	{
-		current_fps = target_fps;
-		perf.fps = target_fps;
-		perf.avg_frame_ms = 1000.0 / target_fps;
-		perf.max_frame_ms = perf.avg_frame_ms;
-	}
-	per_frame_start = SDL_GetPerformanceCounter();
+	frame_stats_sample(target_fps, 0);
 }
 
 // if a fake vsycn delay is really needed

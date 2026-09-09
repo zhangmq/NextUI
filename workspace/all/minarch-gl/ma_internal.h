@@ -110,7 +110,7 @@ extern int DEVICE_WIDTH;
 extern int DEVICE_HEIGHT;
 extern int DEVICE_PITCH;
 extern int ambient_mode;
-extern int show_debug;
+extern volatile int show_debug;
 extern int shader_reset_suppressed;
 
 extern char* scaling_labels[];
