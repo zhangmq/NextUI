@@ -539,18 +539,6 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	int dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
 	ma_gl_compute_present_rect((int)disp_w, (int)disp_h,
 			&dst_x, &dst_y, &dst_w, &dst_h);
-	// DIAG: log the raw present-rect numbers every ~10s (math, not image).
-	{
-		static int rl = 0;
-		rl++;
-		int r_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
-		if (r_every < 1) r_every = 1;
-		if (rl % r_every == 1)
-			LOG_info("RECT frame=%ux%u disp=%ux%u rot=%u rect=%d,%d %ux%u dev=%dx%d scale=%d aspect=%.4f\n",
-				width, height, disp_w, disp_h, ma_gl_rotation,
-				dst_x, dst_y, dst_w, dst_h,
-				DEVICE_WIDTH, DEVICE_HEIGHT, screen_scaling, core.aspect_ratio);
-	}
 	// Screen X/Y offsets (frontend-specific, no RA equivalent): applied to
 	// the SCREEN-space rect. NOTE the y sign: dst_y goes through the NDC
 	// conversion below (cy = 1 - 2y/H, which treats dst_y as screen-y-down
@@ -592,39 +580,6 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// final pass (single source of truth).
 	float ortho[16];
 	PLAT_compute_present_mvp(ma_gl_rotation, ortho);
-
-	// DIAG(dump): quad geometry as numbers, alongside the image dumps --
-	// lets the quad formula be checked offline against the FBO content
-	// region (0,0..640x480 of the 1024x1024 FBO). TEMPORARY.
-	{
-		static int qdump = 0;
-		qdump++;
-		int q_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
-		if (q_every < 1) q_every = 1;
-		if (qdump % q_every == 1) {
-			FILE *pf = fopen("/tmp/dump_quad_params.txt", "w");
-			if (pf) {
-				fprintf(pf, "frame=%ux%u fbo=%ux%u rot=%u\n",
-					width, height, ma_gl_fbo_dim_cur, ma_gl_fbo_dim_cur,
-					ma_gl_rotation);
-				fprintf(pf, "uv tw=%f th=%f (content / fbo)\n", tw, th);
-				fprintf(pf, "viewport dst=%d,%d %ux%u\n",
-					dst_x, dst_y, dst_w, dst_h);
-				fprintf(pf, "coords:[");
-				for (int i = 0; i < 16; i++)
-					fprintf(pf, "%s%.4f", i ? "," : "", coords[i]);
-				fprintf(pf, "]\n");
-				fprintf(pf, "ortho:[");
-				for (int i = 0; i < 16; i++)
-					fprintf(pf, "%s%.4f", i ? "," : "", ortho[i]);
-				fprintf(pf, "]\n");
-				fclose(pf);
-				LOG_info("DUMPQP %ux%u fbo=%u tw=%f th=%f dst=%d,%d %ux%u rot=%u\n",
-					width, height, ma_gl_fbo_dim_cur, tw, th,
-					dst_x, dst_y, dst_w, dst_h, ma_gl_rotation);
-			}
-		}
-	}
 
 	// Draw the quad with a clean pipeline. GL_FRAMEBUFFER (READ + DRAW)
 	// binds to 0 here, which also pins the menu-capture contract: the
@@ -674,46 +629,6 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 				width, height, 1, dst_x, dst_y, dst_w, dst_h,
 				(float)ma_gl_fbo_dim_cur, (float)ma_gl_fbo_dim_cur,
 				ma_gl_rotation);
-		// DIAG(dump): capture the full shader-chain output (FBO 0 after the
-		// final pass). TEMPORARY.
-		{
-			static int ds = 0;
-			ds++;
-			int q_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
-			if (q_every < 1) q_every = 1;
-			if (ds % q_every == 1) {
-				GLint pfbo = 0;
-				char path[128];
-				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
-				snprintf(path, sizeof(path), "/tmp/dump_chainout_%03d.rgb", ds / q_every + 1);
-				FILE *f = fopen(path, "wb");
-				if (f) {
-					SDL_Window *dwin = PLAT_getGLWindow();
-					int dw = 0, dh = 0;
-					if (dwin) SDL_GL_GetDrawableSize(dwin, &dw, &dh);
-					unsigned w = (dw > 0) ? (unsigned)dw : DEVICE_WIDTH;
-					unsigned h = (dh > 0) ? (unsigned)dh : DEVICE_HEIGHT;
-					unsigned char *buf = malloc((size_t)w * h * 3);
-					unsigned char *rgba = malloc((size_t)w * h * 4);
-					glBindFramebuffer(GL_FRAMEBUFFER, 0);
-					glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-					for (unsigned y = 0; y < h; y++) {
-						unsigned char *row = rgba + (size_t)y * w * 4;
-						for (unsigned x = 0; x < w; x++) {
-							buf[(size_t)y * w * 3 + x * 3]     = row[x * 4];
-							buf[(size_t)y * w * 3 + x * 3 + 1] = row[x * 4 + 1];
-							buf[(size_t)y * w * 3 + x * 3 + 2] = row[x * 4 + 2];
-						}
-					}
-					fwrite(buf, 1, (size_t)w * h * 3, f);
-					free(rgba);
-					free(buf);
-					fclose(f);
-					LOG_info("DUMPCHAINOUT %s (%ux%u fbo=%d)\n", path, w, h, pfbo);
-				}
-				glBindFramebuffer(GL_FRAMEBUFFER, pfbo);
-			}
-		}
 	} else {
 		glUseProgram(ma_gl_present_prog);
 		if (ma_gl_present_mvp_loc >= 0) {
@@ -737,49 +652,6 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
 				g_sharpness_linear ? GL_LINEAR : GL_NEAREST);
 		ma_gl_present_draw(coords);
-		// DIAG(dump): capture the quad output AT THE DRAW SITE -- right
-		// after the draw, before ANY teardown (no overlay, no swap). Read
-		// FBO 0 (the quad's target) in full. TEMPORARY.
-		{
-			static int dumpq = 0;
-			dumpq++;
-			int q_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
-			if (q_every < 1) q_every = 1;
-			if (dumpq % q_every == 1) {
-				GLint pfbo = 0;
-				char path[128];
-				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
-				snprintf(path, sizeof(path), "/tmp/dump_drawsite_%03d.rgb", dumpq / q_every + 1);
-				FILE *f = fopen(path, "wb");
-				if (f) {
-					SDL_Window *dwin = PLAT_getGLWindow();
-					int dw = 0, dh = 0;
-					if (dwin) SDL_GL_GetDrawableSize(dwin, &dw, &dh);
-					unsigned w = (dw > 0) ? (unsigned)dw : DEVICE_WIDTH;
-					unsigned h = (dh > 0) ? (unsigned)dh : DEVICE_HEIGHT;
-					unsigned char *buf = malloc((size_t)w * h * 3);
-					unsigned char *rgba = malloc((size_t)w * h * 4);
-					glBindFramebuffer(GL_FRAMEBUFFER, 0);
-					glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-					for (unsigned y = 0; y < h; y++) {
-						unsigned char *row = rgba + (size_t)y * w * 4;
-						for (unsigned x = 0; x < w; x++) {
-							buf[(size_t)y * w * 3 + x * 3]     = row[x * 4];
-							buf[(size_t)y * w * 3 + x * 3 + 1] = row[x * 4 + 1];
-							buf[(size_t)y * w * 3 + x * 3 + 2] = row[x * 4 + 2];
-						}
-					}
-					fwrite(buf, 1, (size_t)w * h * 3, f);
-					free(rgba);
-					free(buf);
-					fclose(f);
-					LOG_info("DUMPDRAWSITE %s (%ux%u fbo=%d sample_tex=%u dim=%u)\n",
-						path, w, h, pfbo, (unsigned)ma_gl_sample_tex(),
-						ma_gl_fbo_dim_cur);
-				}
-				glBindFramebuffer(GL_FRAMEBUFFER, pfbo);
-			}
-		}
 	}
 
 	// Frontend Screen Effect + Overlay (software-path features mirrored
@@ -1005,55 +877,6 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 
 	SDL_GL_MakeCurrent(win, ctx);
 
-	// DIAG(stage-D): FBO1 content check before present. TEMPORARY.
-	// Window extended to F400 @20-frame steps (harness showed first real
-	// frame enters the FBO ~F80; the old 24-frame window never saw it).
-	// Reads the slot the core just rendered into this frame (= write after
-	// the VALID flip above).
-	{
-		static int diagE = 0;
-		diagE++;
-		if (diagE <= 400 && (diagE % 20 == 1)) {
-			static unsigned char diag_fbo[64*64*4];
-			GLint diag_pfbo = 0;
-			glGetIntegerv(GL_FRAMEBUFFER_BINDING, &diag_pfbo);
-			glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_fbo[ma_gl_fbo_write]);
-			memset(diag_fbo, 0, sizeof(diag_fbo));
-			glReadPixels(480-32, 240-32, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, diag_fbo);
-			unsigned long diag_s = 0; int diag_nz = 0;
-			for (int i = 0; i < 64*64*4; i++) { diag_s += diag_fbo[i]; if (diag_fbo[i]) diag_nz++; }
-			LOG_info("DIAGE frame=%d fbo_sum=%lu fbo_nz=%d/%d", diagE, diag_s, diag_nz, 64*64*4);
-			glBindFramebuffer(GL_FRAMEBUFFER, diag_pfbo);
-		}
-	}
-
-	// DIAG(stage-D): right after swap - which fb page has content, pan state,
-	// and EGL surface identity. TEMPORARY. Window extended like DIAGE.
-	// DIRECT-BLIT EXPERIMENT: skip the whole present-quad / shader-chain /
-	// effect / overlay pipeline and blit the core's FBO straight onto the
-	// default framebuffer (the pre-quad landscape path). Environment-variable
-	// switch so we can A/B against ma_gl_present_quad without rebuilding.
-
-	// Sample the core's FBO a second time right before present, to confirm
-	// the content is still there at this exact point of the pipeline.
-	// Reads the WRITE slot (what the core just rendered this frame).
-	{
-		static int diagP = 0;
-		diagP++;
-		if (diagP <= 400 && (diagP % 20 == 1)) {
-			static unsigned char diag_fbo[64*64*4];
-			GLint diag_pfbo = 0;
-			glGetIntegerv(GL_FRAMEBUFFER_BINDING, &diag_pfbo);
-			glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_fbo[ma_gl_fbo_write]);
-			memset(diag_fbo, 0, sizeof(diag_fbo));
-			glReadPixels(480-32, 240-32, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, diag_fbo);
-			unsigned long diag_s = 0; int diag_nz = 0;
-			for (int i = 0; i < 64*64*4; i++) { diag_s += diag_fbo[i]; if (diag_fbo[i]) diag_nz++; }
-			LOG_info("DIAGP frame=%d fbo_sum=%lu fbo_nz=%d/%d", diagP, diag_s, diag_nz, 64*64*4);
-			glBindFramebuffer(GL_FRAMEBUFFER, diag_pfbo);
-		}
-	}
-
 	const char *db = getenv("MINARCH_DIRECT_BLIT");
 	const char *qs = getenv("MINARCH_QUAD_STUB");
 	if (db && db[0] == '1') {
@@ -1137,63 +960,7 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		// glBlitFramebuffer; it was folded in so rotation, scaling, sharpness,
 		// offsets and core-state management each live in exactly one place.
 		ma_gl_present_quad(width, height);
-		// DIAG: FBO control capture (same 10s cadence as DUMPDRAWSITE; the
-		// draw-site dump is inside ma_gl_present_quad right after the draw).
-		{
-			static int dumpf = 0;
-			dumpf++;
-			int dump_every = (core.fps > 1.0) ? (int)(core.fps * 2) : 120;
-			if (dump_every < 1) dump_every = 1;
-			if (dumpf % dump_every == 1) {
-				GLint pfbo = 0;
-				char path[128];
-				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
-				glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_sample_fbo());
-				snprintf(path, sizeof(path), "/tmp/dump_fbo_%03d.rgb", dumpf / dump_every + 1);
-				FILE *f = fopen(path, "wb");
-				if (f) {
-					unsigned dim = ma_gl_fbo_dim_cur;
-					unsigned char *buf = malloc((size_t)dim * dim * 3);
-					unsigned char *rgba = malloc((size_t)dim * dim * 4);
-					glReadPixels(0, 0, dim, dim, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-					for (unsigned y = 0; y < dim; y++) {
-						unsigned char *row = rgba + (size_t)y * dim * 4;
-						for (unsigned x = 0; x < dim; x++) {
-							buf[(size_t)y * dim * 3 + x * 3]     = row[x * 4];
-							buf[(size_t)y * dim * 3 + x * 3 + 1] = row[x * 4 + 1];
-							buf[(size_t)y * dim * 3 + x * 3 + 2] = row[x * 4 + 2];
-						}
-					}
-					fwrite(buf, 1, (size_t)dim * dim * 3, f);
-					free(rgba);
-					free(buf);
-					fclose(f);
-					LOG_info("DUMPFBO %s (%ux%u)\n", path, dim, dim);
-				}
-				glBindFramebuffer(GL_FRAMEBUFFER, pfbo);
-			}
-		}
 		SDL_GL_SwapWindow(win);
-	}
-	{
-		static int diagD = 0;
-		static int diag_fb = -1;
-		diagD++;
-		if (diagD <= 400 && (diagD % 20 == 1)) {
-			struct fb_var_screeninfo vinfo;
-			if (diag_fb < 0) diag_fb = open("/dev/fb0", O_RDONLY);
-			int yoff = -1;
-			if (diag_fb >= 0 && ioctl(diag_fb, FBIOGET_VSCREENINFO, &vinfo) == 0)
-				yoff = vinfo.yoffset;
-			// sample the middle row of the visible page: count nonzero pixels
-			static unsigned char row[720*4];
-			int nz = -1;
-			if (diag_fb >= 0 && pread(diag_fb, row, sizeof(row), yoff*2880 + 240*2880) == sizeof(row)) {
-				nz = 0;
-				for (int i = 0; i < 720*4; i++) if (row[i]) nz++;
-			}
-			LOG_info("DIAGD frame=%d yoff=%d midrow_nz=%d/2880", diagD, yoff, nz);
-		}
 	}
 }
 

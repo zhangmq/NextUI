@@ -2094,38 +2094,6 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 		glUniform2fv(shader_program->u_texelSize, 1, texelSize);
 	}
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	// DIAG(pass-state): first 3 draws + every 600th: object validity, FBO
-	// status, GL error right after the draw. TEMPORARY -- remove with the
-	// other dumps.
-	{
-		static int pdiag = 0;
-		pdiag++;
-		if (pdiag <= 3 || (pdiag % 120) == 1) {
-			GLenum perr = glGetError();
-			GLint pfs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-			GLint pvp[4] = {0};
-			GLint pcm[4] = {1,1,1,1};
-			GLint pbind[3] = {-1,-1,-1};
-			glGetIntegerv(GL_VIEWPORT, pvp);
-			glGetIntegerv(GL_COLOR_WRITEMASK, pcm);
-			glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &pbind[0]);
-			glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &pbind[1]);
-			glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &pbind[2]);
-			LOG_info("PASSDIAG #%d prog=%u(%s) src=%u srcIsTex=%d tgt=%u "
-					"tgtIsTex=%d fbo=%u fbStatus=0x%x err=0x%x vp=%d,%d "
-					"%dx%d mvp=%s va=%d/%d mask=%d%d%d%d buf=%d/%d/%d\n",
-				pdiag, (unsigned)shader_program_handle,
-				shader_program->filename ? shader_program->filename : "?",
-				(unsigned)src_texture, (int)glIsTexture(src_texture),
-				target_texture ? (unsigned)*target_texture : 0,
-				target_texture ? (int)glIsTexture(*target_texture) : -1,
-				(unsigned)fbo, (unsigned)pfs,
-				(unsigned)perr, pvp[0], pvp[1], pvp[2], pvp[3],
-				mvp ? "set" : "null",
-				posAttrib, texAttrib, pcm[0], pcm[1], pcm[2], pcm[3],
-				pbind[0], pbind[1], pbind[2]);
-		}
-	}
 	last_program = shader_program_handle;
 }
 
@@ -2201,47 +2169,6 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 			(i == nrofshaders - 1) ? s_pass_finalscale.filter : shaders[i+1].filter,
 			0, 0, pass_dst_w, pass_dst_h,
 			gl_chain_mvp, 1);
-
-		// DIAG(dump): the first chain pass output (pass-0 FBO), read back
-		// in render convention right after the pass (the FBO is still
-		// bound). TEMPORARY -- remove with the other dumps.
-		{
-			static int p0d = 0;
-			p0d++;
-			// ~10 s at 60 fps; the hw path never advances frame_count
-			// (that only happens in the software present), so this dump
-			// uses its own cadence.
-			if (i == 0 && (p0d % 120) == 1) {
-				GLint pfbo = 0;
-				char path[128];
-				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pfbo);
-				snprintf(path, sizeof(path), "/tmp/dump_pass0_%03d.rgb",
-						p0d / 120 + 1);
-				unsigned pw = gl_next_pow2(pass_dst_w);
-				unsigned ph = gl_next_pow2(pass_dst_h);
-				FILE *f = fopen(path, "wb");
-				if (f) {
-					unsigned char *buf = malloc((size_t)pw * ph * 3);
-					unsigned char *rgba = malloc((size_t)pw * ph * 4);
-					glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-					for (unsigned y = 0; y < ph; y++) {
-						unsigned char *row = rgba + (size_t)y * pw * 4;
-						for (unsigned x = 0; x < pw; x++) {
-							buf[(size_t)y * pw * 3 + x * 3]     = row[x * 4];
-							buf[(size_t)y * pw * 3 + x * 3 + 1] = row[x * 4 + 1];
-							buf[(size_t)y * pw * 3 + x * 3 + 2] = row[x * 4 + 2];
-						}
-					}
-					fwrite(buf, 1, (size_t)pw * ph * 3, f);
-					free(rgba);
-					free(buf);
-					fclose(f);
-					LOG_info("DUMPPASS0 %s (%ux%u fbo=%d src=%ux%u)\n", path,
-							pw, ph, pfbo, src_w, src_h);
-				}
-				glBindFramebuffer(GL_FRAMEBUFFER, pfbo);
-			}
-		}
 
 		last_w = pass_dst_w;
 		last_h = pass_dst_h;
