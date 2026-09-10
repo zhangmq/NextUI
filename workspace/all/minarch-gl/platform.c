@@ -25,6 +25,7 @@
 
 #include <dirent.h>
 #include <stdint.h>
+#include <string.h>
 
 int panel_w = 640;
 int panel_h = 480;
@@ -606,6 +607,41 @@ void PLAT_getGPUSpeed() {
 
 	int speed = path ? getInt(path) : 0;
 	perf.gpu_speed = speed > 0 ? speed / 1000000 : 648; // MHz
+}
+
+// GPU utilisation. The sunxi debugfs node reports the share of time the GPU
+// was busy since the previous read ("Utilisation from last show:N%;"), i.e.
+// an interval counter, not an instantaneous value. No other node exposes GPU
+// load on this kernel (mali0/debugfs and devfreq/gpu have none). Sample it on
+// the same 100 ms cadence as the CPU monitor and smooth lightly, otherwise
+// per-frame reads would show a 16 ms window with visible jitter.
+//
+// Read with open/read, not getFile(): debugfs seq_files report st_size 0, so
+// getFile()'s fseek/ftell reads zero bytes and the value would stay 0.
+void PLAT_getGPUUsage() {
+	static uint64_t last_sample = 0;
+	static double smoothed = 0.0;
+	static char buf[256];
+
+	uint64_t now = getMicroseconds();
+	if (last_sample && now - last_sample < 100000) return;
+	last_sample = now;
+
+	int fd = open("/sys/kernel/debug/sunxi_gpu/dump", O_RDONLY);
+	if (fd < 0) return;
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0) return;
+	buf[n] = '\0';
+
+	char* line = strstr(buf, "Utilisation");
+	if (!line) return;
+	char* colon = strchr(line, ':');
+	if (!colon) return;
+
+	double usage = atoi(colon + 1);
+	smoothed = (smoothed > 0.0) ? smoothed * 0.7 + usage * 0.3 : usage;
+	perf.gpu_usage = smoothed;
 }
 
 static struct WIFI_connection connection = {

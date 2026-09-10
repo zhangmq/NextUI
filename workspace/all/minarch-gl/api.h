@@ -345,11 +345,10 @@ SDL_Color /*GFX_*/ uintToColour(uint32_t rgba);
 
 void GFX_startFrame(void);
 void GFX_flip(SDL_Surface* screen);
-// Shared per-output-frame statistics sampler (single source of truth for the
-// debug-HUD fps/avg/max/drops): software GFX_flip/GFX_GL_Swap/
-// GFX_flip_fixed_rate sample inside themselves; the GL hw-render path calls
-// this once per presented frame (core-paced, no clamping).
-void GFX_frameStats_tick(double target_fps);
+// The software present paths (GFX_flip / GFX_GL_Swap / GFX_flip_fixed_rate)
+// sample their per-frame statistics -- and the audio-clock current_fps --
+// inside themselves. The GL hw-render path has a separate HUD-only stats
+// tick with its own state: MA_GL_hud_stats_tick (ma_gl.h).
 void PLAT_flipHidden();
 void GFX_flip_fixed_rate(SDL_Surface* screen, double target_fps); // if target_fps is 0, then use the native screen FPS
 #define GFX_supportsOverscan PLAT_supportsOverscan // (void)

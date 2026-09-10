@@ -104,9 +104,6 @@ static uintptr_t ma_gl_get_current_framebuffer(void) {
 static GLuint ma_gl_sample_tex(void) {
 	return ma_gl_fbo_tex[ma_gl_fbo_write];
 }
-static GLuint ma_gl_sample_fbo(void) {
-	return ma_gl_fbo[ma_gl_fbo_write];
-}
 
 static bool ma_gl_create_fbo(void) {
 	unsigned dim = ma_gl_fbo_dim();
@@ -852,14 +849,15 @@ void MA_GL_context_destroy(void) {
 // GL hw-render debug HUD (flycast etc.): the software drawDebugHud only runs
 // on CPU-frame video callbacks, which hw-render cores never deliver. Mirror
 // the same perf text as one MangoHud-style line, rendered with the frontend's
-// TTF font (font.micro = 14 px) on a translucent black panel.
+// TTF font (font.tiny = 20 px) on a translucent black panel.
 //
 // Threading (SDL_ttf is not thread-safe and the minarch notification/menu
 // rendering uses it on the main thread): the text is rasterized on the MAIN
 // loop thread (MA_GL_hud_update, called from minarch.c where the perf stats
-// are also sampled), copied into a fixed shared RGBA buffer under a mutex.
-// The core's video callback thread (MA_GL_video_refresh -> ma_gl_draw_debug_hud)
-// only uploads that buffer and draws the quad, never touching SDL_ttf.
+// are also sampled) and published to the core's video callback thread
+// (MA_GL_video_refresh -> ma_gl_draw_debug_hud) lock-free via a seqlock, so
+// the video thread only samples a complete buffer and never waits. It uploads
+// that buffer and draws the quad, never touching SDL_ttf.
 //
 // Alpha: the panel is translucent, so it is NOT drawn with ma_gl_present_prog
 // (that shader forces alpha = 1, RA modern_opaque, to keep game textures from
@@ -871,13 +869,20 @@ void MA_GL_context_destroy(void) {
 #define MA_GL_HUD_MAX_H 44
 #define MA_GL_HUD_PAD 8
 #define MA_GL_HUD_BG 0x99000000u // ABGR8888: A=0x99 black, translucent
-static GLuint ma_gl_hud_tex = 0;
-static uint32_t *ma_gl_hud_pixels = NULL;
-static int ma_gl_hud_w = 0;
-static int ma_gl_hud_h = 0;
-static volatile int ma_gl_hud_dirty = 0;
+// Lock-free single-producer/single-consumer handoff: the main thread
+// rasterizes the panel into ma_gl_hud_buf, the video thread uploads it. A
+// seqlock (even = stable, odd = a write is in progress) lets the consumer
+// detect a race and re-upload, so neither thread ever waits on the other --
+// the video thread only samples a buffer it observed to be complete.
+static uint32_t ma_gl_hud_buf[MA_GL_HUD_MAX_W * MA_GL_HUD_MAX_H];
+static volatile unsigned ma_gl_hud_seq = 0;  // seqlock: odd while writing
+static volatile int ma_gl_hud_w = 0;
+static volatile int ma_gl_hud_h = 0;
 static volatile int ma_gl_hud_uploaded = 0; // a valid texture exists on GPU
-static SDL_mutex *ma_gl_hud_mutex = NULL;
+static unsigned ma_gl_hud_uploaded_seq = 0; // consumer-local: last seq uploaded
+static int ma_gl_hud_up_w = 0;              // consumer-local: uploaded panel size
+static int ma_gl_hud_up_h = 0;
+static GLuint ma_gl_hud_tex = 0;
 static GLuint ma_gl_hud_prog = 0;
 static GLint ma_gl_hud_tex_loc = -1;
 
@@ -897,10 +902,54 @@ static const char *ma_gl_hud_fs =
 	"out vec4 fragColor;\n"
 	"void main() { fragColor = texture(uTex, vTex); }\n";
 
+// Frame statistics for the hw-render debug HUD, called on the MAIN thread
+// once per frame (minarch.c). Self-contained on purpose: it keeps its own
+// timestamp and rolling window and writes ONLY the perf fields the HUD
+// displays. It must never write current_fps -- that variable is the SOFTWARE
+// paths' audio resample denominator (SND_batchSamples divides by it), and
+// feeding it from this hw-render loop made the audio pitch follow the
+// frontend loop rate.
+#define MA_GL_HUD_STATS_WINDOW 50
+void MA_GL_hud_stats_tick(void) {
+	if (!MA_GL_is_active() || !show_debug) return;
+
+	static uint64_t last_counter = 0;
+	static double   fps_history[MA_GL_HUD_STATS_WINDOW];
+	static double    ms_history[MA_GL_HUD_STATS_WINDOW];
+	static int      history_index = 0;
+	static int      history_count = 0;
+
+	uint64_t now = SDL_GetPerformanceCounter();
+	if (!last_counter) { last_counter = now; return; }
+
+	double ms = (double)(now - last_counter) * 1000.0
+			/ (double)SDL_GetPerformanceFrequency();
+	last_counter = now;
+
+	// Ignore nonsense intervals (a 1 s gap is far beyond any frame time we
+	// care about); they would otherwise poison the whole window.
+	if (ms <= 0.0 || ms > 1000.0) return;
+
+	fps_history[history_index] = 1000.0 / ms;
+	ms_history[history_index]  = ms;
+	history_index = (history_index + 1) % MA_GL_HUD_STATS_WINDOW;
+	if (history_count < MA_GL_HUD_STATS_WINDOW) history_count++;
+
+	double fps_sum = 0.0, ms_sum = 0.0, ms_max = 0.0;
+	for (int i = 0; i < history_count; i++) {
+		fps_sum += fps_history[i];
+		ms_sum  += ms_history[i];
+		if (ms_history[i] > ms_max) ms_max = ms_history[i];
+	}
+	perf.fps          = fps_sum / history_count;
+	perf.avg_frame_ms = ms_sum / history_count;
+	perf.max_frame_ms = ms_max;
+}
+
 // Called on the MAIN thread once per frame (minarch.c, same place the perf
 // stats tick runs). Rasterizes the HUD line with font.tiny (20 px) onto a
-// translucent black ABGR8888 panel and copies it into the shared upload
-// buffer under the mutex. Re-renders only when the text changed (throttled).
+// translucent black ABGR8888 panel and publishes it to the shared buffer
+// (seqlock, no lock). Re-renders only when the text changed (throttled).
 void MA_GL_hud_update(void) {
 	if (!MA_GL_is_active() || !show_debug) return;
 	if (SDL_GetTicks() < 5000) return; // mirror software HUD warm-up gate
@@ -910,13 +959,15 @@ void MA_GL_hud_update(void) {
 
 	char fps_txt[16], rest[224];
 	// MangoHud-ish single line: measured/requested fps, avg frame time,
-	// CPU (usage/speed/temp), GPU (speed/temp). 20 px caps the worst-case
-	// width at ~660 px < 720 screen, so no wrapping.
+	// CPU (usage/speed/temp), GPU (usage/speed/temp). At 20 px the typical
+	// line measures ~626 px and the physically possible worst case
+	// (100% CPU/GPU, 1512 MHz, 100 C) ~701 px, both inside the 704 px
+	// available on the 720 px screen, so it never wraps or clips.
 	sprintf(fps_txt, "%.0f", perf.fps);
-	sprintf(rest, "/%.0ffps %.0fms CPU: %d%% %dMHz %d\u00b0C GPU: %dMHz %d\u00b0C",
+	sprintf(rest, "/%.0ffps %.0fms CPU: %d%% %dMHz %d\u00b0C GPU: %d%% %dMHz %d\u00b0C",
 		perf.req_fps, perf.avg_frame_ms,
 		(int)(perf.cpu_usage + 0.5), perf.cpu_speed, perf.cpu_temp,
-		perf.gpu_speed, perf.gpu_temp);
+		(int)(perf.gpu_usage + 0.5), perf.gpu_speed, perf.gpu_temp);
 
 	// Throttle: re-rasterize at most ~10x/second AND only when the line
 	// actually changed (the fps digits move constantly, so change alone
@@ -985,23 +1036,17 @@ void MA_GL_hud_update(void) {
 		SDL_FreeSurface(body_surf);
 	}
 
-	// Copy into the shared buffer (kept fixed-size; the texture is re-created
-	// on the render thread when w/h change).
-	if (!ma_gl_hud_pixels)
-		ma_gl_hud_pixels = (uint32_t *)malloc(MA_GL_HUD_MAX_W * MA_GL_HUD_MAX_H * 4);
-	if (!ma_gl_hud_pixels) { SDL_FreeSurface(panel); return; }
-	if (!ma_gl_hud_mutex)
-		ma_gl_hud_mutex = SDL_CreateMutex();
-
-	SDL_LockMutex(ma_gl_hud_mutex);
-	memset(ma_gl_hud_pixels, 0, MA_GL_HUD_MAX_W * MA_GL_HUD_MAX_H * 4);
+	// Publish lock-free under a seqlock: the odd seq marks the write in
+	// progress, the release store of the even seq publishes the pixels and the
+	// panel size together. The consumer re-uploads if it observes the change.
+	__atomic_add_fetch(&ma_gl_hud_seq, 1, __ATOMIC_ACQ_REL);
+	memset(ma_gl_hud_buf, 0, sizeof(ma_gl_hud_buf));
 	for (int y = 0; y < panel_h; y++)
-		memcpy(ma_gl_hud_pixels + y * MA_GL_HUD_MAX_W,
+		memcpy(ma_gl_hud_buf + y * MA_GL_HUD_MAX_W,
 			(uint32_t *)panel->pixels + y * panel_w, panel_w * 4);
 	ma_gl_hud_w = panel_w;
 	ma_gl_hud_h = panel_h;
-	ma_gl_hud_dirty = 1;
-	SDL_UnlockMutex(ma_gl_hud_mutex);
+	__atomic_add_fetch(&ma_gl_hud_seq, 1, __ATOMIC_RELEASE);
 
 	SDL_FreeSurface(panel);
 }
@@ -1015,7 +1060,6 @@ void MA_GL_hud_update(void) {
 // frames the text changed, invisible the rest of the time).
 static void ma_gl_draw_debug_hud(void) {
 	if (!show_debug || SDL_GetTicks() < 5000) return;
-	if (!ma_gl_hud_mutex) return;
 
 	// Lazy program init (GL context is current here).
 	if (!ma_gl_hud_prog) {
@@ -1041,34 +1085,42 @@ static void ma_gl_draw_debug_hud(void) {
 		glGenTextures(1, &ma_gl_hud_tex);
 	if (!ma_gl_hud_tex) return;
 
-	// Upload the new panel contents when the main thread produced some.
-	// Texture storage is fixed at MA_GL_HUD_MAX_W x MA_GL_HUD_MAX_H (the
-	// panel is the top-left w x h sub-rect); upload the whole buffer. 700x44
-	// RGBA is ~123 KB and this only runs when the text changed (a few times
-	// per second), so full re-uploads are cheap and keep the code simple.
-	int w, h;
-	SDL_LockMutex(ma_gl_hud_mutex);
-	if (ma_gl_hud_dirty && ma_gl_hud_pixels && ma_gl_hud_w > 0) {
-		w = ma_gl_hud_w;
-		h = ma_gl_hud_h;
+	// Upload a newly published panel, lock-free: read the seqlock, upload, and
+	// re-upload if the producer wrote meanwhile (it publishes at most ~10x/s,
+	// so a race is rare). Nothing here ever waits for the main thread. Texture
+	// storage is fixed at MAX_W x MAX_H (the panel is the top-left sub-rect);
+	// 700x44 RGBA is ~123 KB and this only runs when the text changed.
+	for (int attempt = 0; attempt < 4; attempt++) {
+		unsigned seq = __atomic_load_n(&ma_gl_hud_seq, __ATOMIC_ACQUIRE);
+		if (seq == ma_gl_hud_uploaded_seq) break; // nothing new to upload
+		if (seq & 1) continue;                    // writer mid-update: retry
+
+		int nw = ma_gl_hud_w, nh = ma_gl_hud_h;
+		if (nw <= 0 || nh <= 0) break;
+
 		glBindTexture(GL_TEXTURE_2D, ma_gl_hud_tex);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MA_GL_HUD_MAX_W, MA_GL_HUD_MAX_H,
-			0, GL_RGBA, GL_UNSIGNED_BYTE, ma_gl_hud_pixels);
-		ma_gl_hud_dirty = 0;
-		ma_gl_hud_uploaded = 1;
-	} else {
-		w = ma_gl_hud_w;
-		h = ma_gl_hud_h;
-	}
-	SDL_UnlockMutex(ma_gl_hud_mutex);
+			0, GL_RGBA, GL_UNSIGNED_BYTE, ma_gl_hud_buf);
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		if (__atomic_load_n(&ma_gl_hud_seq, __ATOMIC_ACQUIRE) != seq)
+			continue; // raced with a publish: upload the newer panel
 
-	// Draw only once a texture is on the GPU; keep drawing every frame
-	// (the upload above already consumed any pending change).
-	if (!ma_gl_hud_uploaded || !w || !h) return;
+		ma_gl_hud_uploaded_seq = seq;
+		ma_gl_hud_up_w = nw;
+		ma_gl_hud_up_h = nh;
+		ma_gl_hud_uploaded = 1;
+		break;
+	}
+
+	// Draw only once a texture is on the GPU; keep drawing every frame with the
+	// last uploaded panel size (the loop above consumed any pending change).
+	if (!ma_gl_hud_uploaded) return;
+	const int w = ma_gl_hud_up_w, h = ma_gl_hud_up_h;
+	if (!w || !h) return;
 
 	// Draw: NDC/clip-space vertices for the panel sub-rect (top-left,
 	// w x h screen pixels), alpha-preserving shader, upright screen space --
@@ -1140,92 +1192,15 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 
 	SDL_GL_MakeCurrent(win, ctx);
 
-	const char *db = getenv("MINARCH_DIRECT_BLIT");
-	const char *qs = getenv("MINARCH_QUAD_STUB");
-	if (db && db[0] == '1') {
-		// Reset the state flycast leaves behind (scissor in particular),
-		// bind the core FBO as READ source and blit to the default fb.
-		glDisable(GL_SCISSOR_TEST);
-		glDisable(GL_DEPTH_TEST);
-		glDisable(GL_CULL_FACE);
-		glDisable(GL_STENCIL_TEST);
-		glDisable(GL_BLEND);
-		// Dual-buffer present: blit the COMPLETED slot.
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, ma_gl_sample_fbo());
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-		glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-		// Clear the draw fb first so letterbox bars are black, not garbage.
-		glClearColor(0.f, 0.f, 0.f, 1.f);
-		glClear(GL_COLOR_BUFFER_BIT);
-		// Source rect = the content region of the 1024^2 FBO (bottom-left
-		// anchored, flycast renders with bottom_left_origin=true).
-		unsigned src_w = width, src_h = height;
-		if (src_w > ma_gl_fbo_dim_cur) src_w = ma_gl_fbo_dim_cur;
-		if (src_h > ma_gl_fbo_dim_cur) src_h = ma_gl_fbo_dim_cur;
-		glBlitFramebuffer(0, 0, (GLint)src_w, (GLint)src_h,
-			0, 0, DEVICE_WIDTH, DEVICE_HEIGHT,
-			GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		SDL_GL_SwapWindow(win);
-	} else if (qs && qs[0] == '1') {
-		// QUAD-STUB: one step past direct-blit -- present the core FBO
-		// TEXTURE through the present program's fullscreen quad instead of
-		// blitting the attachment. Same full-screen stretch (no aspect,
-		// rotation, offsets, shader chain). If this is black while the blit
-		// shows the game, the break is between "FBO attachment" and "FBO
-		// texture sampled by a quad"; if it shows the game too, the quad
-		// path itself is fine and the break is further down the original
-		// pipeline (normalize / chain / effect / overlay).
-		if (!ma_gl_present_prog && !ma_gl_present_init())
-			return;
-
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-		glDisable(GL_DEPTH_TEST);
-		glDisable(GL_CULL_FACE);
-		glDisable(GL_STENCIL_TEST);
-		glDisable(GL_SCISSOR_TEST);
-		glDisable(GL_BLEND);
-		glClearColor(0.f, 0.f, 0.f, 1.f);
-		glClear(GL_COLOR_BUFFER_BIT);
-
-		glUseProgram(ma_gl_present_prog);
-		// Full-screen quad (RA unit vertexes + ortho MVP), UVs map the
-		// content region of the RA-sized FBO.
-		float tw = (float)width / ma_gl_fbo_dim_cur;
-		float th = (float)height / ma_gl_fbo_dim_cur;
-		float coords[16] = {
-			0.f, 0.f,  1.f, 0.f,  0.f, 1.f,  1.f, 1.f,   // vertex
-			0.f, 0.f,  tw,  0.f,  0.f, th,   tw,  th,    // texcoord
-		};
-		if (ma_gl_present_mvp_loc >= 0) {
-			static const float ortho[16] = {
-				2.f, 0.f, 0.f, 0.f,
-				0.f, 2.f, 0.f, 0.f,
-				0.f, 0.f, 1.f, 0.f,
-				-1.f, -1.f, 0.f, 1.f,
-			};
-			glUniformMatrix4fv(ma_gl_present_mvp_loc, 1, GL_FALSE, ortho);
-		}
-		// Sample the slot the core just rendered into (dual-buffer write slot
-		// after the VALID flip above).
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, ma_gl_sample_tex());
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		ma_gl_present_draw(coords);
-		SDL_GL_SwapWindow(win);
-	} else {
-		// Single present path for every orientation (landscape included): the
-		// core renders into the frontend FBO and we present it as a textured
-		// quad -- see ma_gl_present_quad. Landscape previously used
-		// glBlitFramebuffer; it was folded in so rotation, scaling, sharpness,
-		// offsets and core-state management each live in exactly one place.
-		ma_gl_present_quad(width, height);
-		ma_gl_draw_debug_hud();
-		SDL_GL_SwapWindow(win);
-	}
+	// Single present path for every orientation (landscape included): the
+	// core renders into the frontend FBO and we present it as a textured
+	// quad -- see ma_gl_present_quad. Rotation, scaling, sharpness, offsets
+	// and core-state management each live in exactly one place.
+	ma_gl_present_quad(width, height);
+	// Composite the HUD in the same place RA draws its widgets: end of the
+	// driver frame, before the swap.
+	ma_gl_draw_debug_hud();
+	SDL_GL_SwapWindow(win);
 }
 
 // Re-make our GL context current after any frontend UI activity that may have

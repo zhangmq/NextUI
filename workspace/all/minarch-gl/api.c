@@ -303,6 +303,14 @@ static pthread_mutex_t currentcpuinfo = PTHREAD_MUTEX_INITIALIZER;
 FALLBACK_IMPLEMENTATION void *PLAT_cpu_monitor(void *arg) {
     if (!Perf_tryBeginCPUMonitor()) return NULL;
 
+    // get_process_cpu_time_sec() sums every thread of the process, so on a
+    // multi-threaded core (flycast runs emulation/render/audio threads) the
+    // raw ratio reads >100%: 184% meant 1.84 cores busy. Divide by the core
+    // count to report overall machine utilisation in 0..100%, the MangoHud
+    // convention the HUD line follows.
+    int cores = SDL_GetCPUCount();
+    if (cores < 1) cores = 1;
+
     double prev_real_time = get_time_sec();
     double prev_cpu_time = get_process_cpu_time_sec();
 
@@ -318,7 +326,7 @@ FALLBACK_IMPLEMENTATION void *PLAT_cpu_monitor(void *arg) {
         double elapsed_cpu_time = curr_cpu_time - prev_cpu_time;
 
         if (elapsed_real_time > 0) {
-            double cpu_usage = (elapsed_cpu_time / elapsed_real_time) * 100.0;
+            double cpu_usage = (elapsed_cpu_time / elapsed_real_time) * 100.0 / cores;
 
             pthread_mutex_lock(&currentcpuinfo);
 
@@ -756,16 +764,23 @@ void GFX_setAmbientColor(const void *data, unsigned width, unsigned height, size
 	}
 }
 
-// Single source of truth for the per-output-frame statistics that feed the
-// debug HUD (perf.fps / avg_frame_ms / max_frame_ms / frame_drops / jitter
-// and current_fps). Every present path -- software GFX_flip / GFX_GL_Swap /
-// GFX_flip_fixed_rate and the GL hw-render path (GFX_frameStats_tick, called
-// right after its swap) -- samples exactly once per presented frame here.
+// Per-output-frame statistics for the SOFTWARE present paths: GFX_flip /
+// GFX_GL_Swap / GFX_flip_fixed_rate each sample exactly once per presented
+// frame here. Besides the debug-HUD fields (perf.fps / avg_frame_ms /
+// max_frame_ms / frame_drops / jitter) this also owns current_fps, which
+// SND_batchSamples divides by when resampling core audio -- on these paths
+// the present cadence IS the audio clock.
+//
+// The GL hw-render path must not feed this sampler: its loop cadence is not
+// the audio clock, and writing current_fps from there made the audio pitch
+// follow the frontend loop rate. That path keeps its own HUD statistics in
+// ma_gl.c (MA_GL_hud_stats_tick), which fill only the perf display fields.
+//
 // target_fps: the pacing target (drops/jitter are measured against it; the
 // pre-100-frame warm-up reports it instead of an empty average).
 // clamp_to_target: software screen-rate paths clamp absurd frame times to
-// the target so one stalled frame does not drag the rolling average; the
-// core-paced paths (fixed_rate, hw-render) keep the true sample.
+// the target so one stalled frame does not drag the rolling average;
+// GFX_flip_fixed_rate (core-paced) keeps the true sample.
 static void frame_stats_sample(double target_fps, int clamp_to_target)
 {
 	if (target_fps <= 0.0)
@@ -820,13 +835,6 @@ static void frame_stats_sample(double target_fps, int clamp_to_target)
 		perf.max_frame_ms = perf.avg_frame_ms;
 	}
 	per_frame_start = SDL_GetPerformanceCounter();
-}
-
-// hw-render present path statistics: core-paced, no clamping (a true sample
-// even when the core falls behind), same semantics as GFX_flip_fixed_rate.
-void GFX_frameStats_tick(double target_fps)
-{
-	frame_stats_sample(target_fps, 0);
 }
 
 void GFX_flip(SDL_Surface *screen)

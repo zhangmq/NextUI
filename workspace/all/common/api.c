@@ -298,6 +298,14 @@ static pthread_mutex_t currentcpuinfo = PTHREAD_MUTEX_INITIALIZER;
 FALLBACK_IMPLEMENTATION void *PLAT_cpu_monitor(void *arg) {
     if (!Perf_tryBeginCPUMonitor()) return NULL;
 
+    // get_process_cpu_time_sec() sums every thread of the process, so on a
+    // multi-threaded core (flycast runs emulation/render/audio threads) the
+    // raw ratio reads >100%: 184% meant 1.84 cores busy. Divide by the core
+    // count to report overall machine utilisation in 0..100%, the MangoHud
+    // convention the HUD line follows.
+    int cores = SDL_GetCPUCount();
+    if (cores < 1) cores = 1;
+
     double prev_real_time = get_time_sec();
     double prev_cpu_time = get_process_cpu_time_sec();
 
@@ -313,7 +321,7 @@ FALLBACK_IMPLEMENTATION void *PLAT_cpu_monitor(void *arg) {
         double elapsed_cpu_time = curr_cpu_time - prev_cpu_time;
 
         if (elapsed_real_time > 0) {
-            double cpu_usage = (elapsed_cpu_time / elapsed_real_time) * 100.0;
+            double cpu_usage = (elapsed_cpu_time / elapsed_real_time) * 100.0 / cores;
 
             pthread_mutex_lock(&currentcpuinfo);
 

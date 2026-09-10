@@ -61,6 +61,15 @@ void MA_GL_make_current(void);
 // frontend FBOs and re-runs the core's context_reset if the size grew.
 void MA_GL_update_fbo_size(void);
 
+// Debug HUD frame statistics for the hw-render path. Call on the MAIN thread
+// once per frame while the debug HUD is shown. Owns its own sampling state
+// and fills only the perf display fields (fps / avg / max frame time). It
+// deliberately does NOT touch current_fps: that variable is the SOFTWARE
+// paths' audio resample denominator, and feeding it from this (hw-render)
+// loop made the audio pitch follow the frontend loop rate. No-op when no
+// GLES hw-render core is active or show_debug is off.
+void MA_GL_hud_stats_tick(void);
+
 // Debug HUD text rasterization for the hw-render path. Call on the MAIN
 // thread once per frame while the debug HUD is shown (the software
 // drawDebugHud never runs for hw-render cores). Renders the perf line with

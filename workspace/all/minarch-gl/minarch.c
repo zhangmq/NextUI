@@ -271,30 +271,28 @@ int main(int argc , char* argv[]) {
 		// video callback.
 		MA_GL_frame_throttle();
 
-		// GL hw-render path: the software present functions
-		// (GFX_flip/GFX_GL_Swap/GFX_flip_fixed_rate) that own the
-		// per-frame statistics never run for hw-render cores (their video
-		// callback presents straight from MA_GL_video_refresh), so sample
-		// the shared statistics here once per retro_run instead --
-		// core-paced, same single source of truth as the software paths.
-		if (MA_GL_is_active())
-			GFX_frameStats_tick(core.fps);
-
-		// CPU/GPU telemetry for the debug HUD: the software path reads the
-		// sysfs-backed PLAT_get* fields inside drawDebugHud, which never
-		// runs for hw-render cores. Poll them on this (main) thread -- not
-		// on the core's render thread -- once per frame while the HUD is
-		// shown. perf.cpu_usage is fed by the separate CPU monitor thread
-		// (updateCPUMonitor), enabled together with show_debug.
+		// GL hw-render debug HUD: the software paths' statistics sampler
+		// (GFX_flip/GFX_GL_Swap/GFX_flip_fixed_rate) never runs for hw-render
+		// cores, and its current_fps must NOT be fed from this loop either --
+		// current_fps is the software paths' audio resample denominator, and
+		// writing it here made the audio pitch follow the main-loop rate.
+		// MA_GL_hud_stats_tick keeps its own state and fills only the perf
+		// display fields.
+		//
+		// The CPU/GPU telemetry is polled on this (main) thread -- not on the
+		// core's render thread -- once per frame while the HUD is shown;
+		// perf.cpu_usage comes from the separate CPU monitor thread
+		// (updateCPUMonitor), enabled together with show_debug. The TTF text
+		// rasterization (MA_GL_hud_update) also stays here because the
+		// notification/menu code uses the same font objects on this thread;
+		// the video-callback thread only uploads and draws the panel.
 		if (show_debug && MA_GL_is_active()) {
+			MA_GL_hud_stats_tick();
 			PLAT_getCPUTemp();
 			PLAT_getCPUSpeed();
 			PLAT_getGPUTemp();
 			PLAT_getGPUSpeed();
-			// GL hw-render debug HUD text: rasterize on the main thread
-			// (SDL_ttf is used by the notification/menu code there and is
-			// not thread-safe); the video-callback thread only uploads the
-			// pixels and draws them.
+			PLAT_getGPUUsage();
 			MA_GL_hud_update();
 		}
 		
