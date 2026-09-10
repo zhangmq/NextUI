@@ -2996,7 +2996,18 @@ size_t SND_batchSamples(const SND_Frame *frames, size_t frame_count)
 				// the NEXT SND_batchSamples call, which is this one.
 				// Unpause before waiting -- backpressure requires a
 				// consuming device (RA blocking-write semantics).
+				//
+				// Drop the ring lock across the call: SDL's pause path takes
+				// the audio DEVICE lock, and the audio callback runs holding
+				// that device lock while it takes audio_mutex. Calling it
+				// here under audio_mutex would invert the order and deadlock
+				// (main thread: audio_mutex -> device lock; audio thread:
+				// device lock -> audio_mutex).
+				pthread_mutex_unlock(&audio_mutex);
 				SND_pauseAudio(false);
+				pthread_mutex_lock(&audio_mutex);
+				if ((snd.frame_in + 1) % snd.frame_count != snd.frame_out)
+					break; // space appeared while unlocked: write now
 				// Wait for the SDL audio callback to drain.
 				// Timeout guards against a dead audio device (e.g. sink
 				// switch); with no consumer the producer just ticks slowly.
