@@ -264,6 +264,10 @@ int main(int argc , char* argv[]) {
 	while (!quit) {
 		GFX_startFrame();
 
+		/* Clear the "audio wrote this frame" flag (read by
+		 * MA_GL_frame_throttle for RA-style pace composition). */
+		ma_audio_wrote_frame = 0;
+
 		run_frame();
 
 		// RA runloop pacing for hardware-render cores: spend the frame

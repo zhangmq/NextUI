@@ -96,6 +96,10 @@ extern int newScreenshot;
 extern int fast_forward;
 extern int rewinding;
 extern int ff_audio;
+/* Set by the libretro audio batch callback whenever a frame actually wrote
+ * audio into the ring buffer (RA pace composition: audio backpressure then
+ * holds the loop, so the main-loop timer must not add a second sleep). */
+extern volatile int ma_audio_wrote_frame;
 extern int use_core_fps;
 extern int rewind_pressed;
 extern int rewind_toggle;

@@ -707,6 +707,16 @@ void MA_GL_set_rotation(unsigned rotation) {
 static void ma_gl_throttle(double fps) {
 	if (fast_forward || fps <= 0.0) return;
 
+	/* RA pace composition (runloop.c RUNLOOP_PACE_*): if this frame's
+	 * audio reached the ring buffer, SND's blocking write already held
+	 * retro_run to the sound-card rate (audio backpressure). Sleeping
+	 * here on top of that would add idle time the weak device could
+	 * spend on the next frame, so skip the timer entirely. The timer is
+	 * only the fallback for frames that wrote no audio (silent scenes,
+	 * muted cores), where nothing else holds the loop (RA gap). */
+	if (ma_audio_wrote_frame)
+		return;
+
 	static int64_t frame_index = -1;
 	static int64_t first_frame_start_time = 0;
 	static double last_fps = 0.0;

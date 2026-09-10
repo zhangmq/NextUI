@@ -7,6 +7,8 @@
 
 static bool resetAudio = false;
 
+volatile int ma_audio_wrote_frame = 0;
+
 void Audio_onSinkChanged(int device, int watch_event) {
 	switch (watch_event) {
 	case DIRWATCH_CREATE:      LOG_info("callback reason: DIRWATCH_CREATE\n");      break;
@@ -53,12 +55,18 @@ size_t audio_sample_batch_callback(const int16_t *data, size_t frames) {
 	// throttled by vsync and the buffer doesn't overflow).
 	SND_setBlockOnFull(MA_GL_is_active());
 	if (!fast_forward || ff_audio) {
+		size_t written;
 		if (use_core_fps || fast_forward) {
-			return SND_batchSamples_fixed_rate((const SND_Frame*)data, frames);
+			written = SND_batchSamples_fixed_rate((const SND_Frame*)data, frames);
 		}
 		else {
-			return SND_batchSamples((const SND_Frame*)data, frames);
+			written = SND_batchSamples((const SND_Frame*)data, frames);
 		}
+		/* A frame that reached the ring buffer is paced by audio
+		 * backpressure (RA RUNLOOP_PACE_AUDIO); the main-loop timer must
+		 * not add a second sleep on top of it. */
+		ma_audio_wrote_frame = 1;
+		return written;
 	}
 	else return frames;
 }
