@@ -964,18 +964,20 @@ void MA_GL_hud_update(void) {
 	if (!MA_GL_is_active() || !show_debug) return;
 	if (SDL_GetTicks() < 5000) return; // mirror software HUD warm-up gate
 	if (!font.tiny) return;
-	if (isnan(perf.fps) || isnan(perf.req_fps) || isnan(perf.avg_frame_ms)
+	if (isnan(perf.fps) || isnan(perf.avg_frame_ms)
 			|| isnan(perf.max_frame_ms)) return;
 
 	char fps_txt[16], rest[224];
-	// MangoHud-ish single line: measured/requested fps, avg frame time,
-	// CPU (usage/speed/temp), GPU (usage/speed/temp). At 20 px the typical
-	// line measures ~626 px and the physically possible worst case
-	// (100% CPU/GPU, 1512 MHz, 100 C) ~701 px, both inside the 704 px
-	// available on the 720 px screen, so it never wraps or clips.
-	sprintf(fps_txt, "%.0f", perf.fps);
-	sprintf(rest, "/%.0ffps %.0fms CPU: %d%% %dMHz %d\u00b0C GPU: %d%% %dMHz %d\u00b0C",
-		perf.req_fps, perf.avg_frame_ms,
+	// MangoHud-ish single line: measured fps (labelled), avg frame time, CPU
+	// (usage/speed/temp), GPU (usage/speed/temp). No requested/target fps:
+	// the core reports the board's video rate (flycast always says 59.94 for
+	// NTSC), not the rate the game actually submits frames at, so a 30 fps
+	// title reads "30/60" and looks like a fault that isn't there. The labelled
+	// value is no wider than the old pair, so the line still fits the 704 px
+	// available at 20 px on the 720 px screen and never wraps or clips.
+	sprintf(fps_txt, "fps: %.0f", perf.fps);
+	sprintf(rest, " %.0fms CPU: %d%% %dMHz %d\u00b0C GPU: %d%% %dMHz %d\u00b0C",
+		perf.avg_frame_ms,
 		(int)(perf.cpu_usage + 0.5), perf.cpu_speed, perf.cpu_temp,
 		(int)(perf.gpu_usage + 0.5), perf.gpu_speed, perf.gpu_temp);
 
@@ -996,15 +998,13 @@ void MA_GL_hud_update(void) {
 	}
 	last_render_ticks = now;
 
-	// Colours: fps value green when on target, amber/red when falling
-	// behind (MangoHud fps convention); the rest light grey. Panel
-	// background is painted translucent black by the caller.
-	double ratio = (perf.req_fps > 0.0) ? perf.fps / perf.req_fps : 1.0;
-	SDL_Color fps_col;
-	if      (ratio >= 0.95) fps_col = (SDL_Color){110, 220, 110, 255}; // green
-	else if (ratio >= 0.75) fps_col = (SDL_Color){235, 205, 80, 255};  // amber
-	else                    fps_col = (SDL_Color){225, 90, 80, 255};   // red
+	// One plain colour for the whole line. The old green/amber/red judgement
+	// compared the measured fps with the core's nominal rate -- the very value
+	// that turned out not to be meaningful for this HUD (see above), and one
+	// that paints a 30 fps title red. Panel background is painted translucent
+	// black by the caller.
 	SDL_Color body_col = { 215, 215, 215, 255 };
+	SDL_Color fps_col = body_col;
 
 	// Measure each part so the body starts right after the fps value.
 	int fps_w = 0, body_w = 0;
