@@ -26,6 +26,7 @@ CORES+= vic
 CORES+= prboom
 CORES+= bluemsx
 CORES+= gearcoleco
+CORES+= flycast
 
 ###############################
 
@@ -129,6 +130,29 @@ bluemsx_MAKEFILE = Makefile.libretro
 gearcoleco_REPO = https://github.com/drhelius/Gearcoleco.git
 gearcoleco_CORE = gearcoleco_libretro.so
 gearcoleco_BUILD_PATH = gearcoleco/platforms/libretro
+
+# flycast: CMake-based libretro core (same shape as mgba above). Pinned to v2.0 --
+# the build picked for H700 after the 2026-09-10/11 version sweep (see
+# shared/NextUI/WORKLOG.md, 2026-09-11). Upstream is flyinghead/flycast, NOT
+# libretro/flycast (that one is a deprecated fork: no GLES, no pvr message queue).
+flycast_REPO = https://github.com/flyinghead/flycast
+flycast_HASH = aa97a6d64fb47d3ce0febaa575b26d975dd916e4
+# LIBRETRO=ON only needs libchdr (SDL/luabridge/breakpad are standalone-only), but
+# libchdr's own submodules (zlib-1.2.11, lzma) must come in recursively -- the shared
+# template's SUBMODULES branch updates non-recursively, so MAKE re-runs it.
+flycast_SUBMODULES = core/deps/libchdr
+flycast_CORE = build-h700/flycast_libretro.so
+# -DCMAKE_CXX_STANDARD=17 is required here: v2.0's CMakeLists sets no standard and the
+# toolchain gcc 8.3 defaults to gnu++14 (gcc 12 defaults to gnu++17, so the earlier
+# host-built core never needed this). No source patches needed on this toolchain:
+# libzip's arc4random probe fails naturally against the glibc 2.28 sysroot.
+flycast_MAKE = git submodule update --init --recursive core/deps/libchdr && \
+	cmake -S . -B build-h700 -DCMAKE_BUILD_TYPE=Release -DLIBRETRO=ON \
+		-DUSE_GLES=ON -DUSE_GLES2=OFF -DUSE_VULKAN=OFF -DUSE_OPENMP=OFF \
+		-DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+		-DCMAKE_C_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" \
+		-DCMAKE_CXX_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common -D_GNU_SOURCE" && \
+	cmake --build build-h700 --target flycast_libretro -- $(PROCS)
 
 ###############################
 
