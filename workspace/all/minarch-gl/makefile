@@ -24,6 +24,21 @@ MERGED_DIR = ../.minarch-gl-build
 UPSTREAM    = ../minarch
 TARGET      = minarch-gl
 
+# Upstream's SOURCE list, verbatim from all/minarch/makefile.  The wrapper hands
+# it to the recursive make on the COMMAND LINE, which is how the overlay swaps
+# an upstream translation unit for one of ours without editing upstream or
+# shipping a makefile into the merged tree: replace the path here (api.c,
+# platform.c, ...) and drop the corresponding file into this directory.
+# generic_video.c needs no entry -- h700 platform.c #includes it, so overriding
+# platform.c is what selects our copy.
+UPSTREAM_SOURCE = minarch.c ma_cheats.c ma_rewind.c ma_audio.c ma_input.c \
+	ma_options.c ma_frontend_opts.c ma_saves.c ma_video.c ma_core.c ma_game.c \
+	ma_environment.c ma_config.c ma_menu.c ma_runframe.c \
+	../common/scaler.c ../common/utils.c ../common/config.c ../common/api.c \
+	../common/notification.c ../../h700/platform/platform.c \
+	../common/http.c ../common/ra_badges.c ../common/ra_offline.c \
+	../common/ra_sync.c ../common/ra_event_queue.c ra_integration.c chd_reader.c
+
 all:
 	rm -rf $(MERGED_DIR)
 	mkdir -p $(MERGED_DIR)
@@ -34,7 +49,8 @@ all:
 	@# different SOURCE list, that is done with the MERGED=1 switch this file
 	@# used to carry, not by shipping this file into the tree.)
 	@files="$$(ls *.c *.h 2>/dev/null)"; [ -n "$$files" ] && cp -f $$files $(MERGED_DIR)/ || true
-	$(MAKE) -C $(MERGED_DIR) -f makefile PLATFORM=$(PLATFORM) UNION_PLATFORM=$(UNION_PLATFORM)
+	$(MAKE) -C $(MERGED_DIR) -f makefile PLATFORM=$(PLATFORM) UNION_PLATFORM=$(UNION_PLATFORM) \
+		SOURCE="$(UPSTREAM_SOURCE)"
 	mkdir -p build/$(PLATFORM)
 	cp -f $(MERGED_DIR)/build/$(PLATFORM)/minarch.elf build/$(PLATFORM)/$(TARGET).elf
 	rm -rf $(MERGED_DIR)
