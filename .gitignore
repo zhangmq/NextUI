@@ -7,6 +7,9 @@
 
 build
 releases
+# minarch-gl build scratch tree (the makefile merges minarch/ + minarch-gl/
+# into it, then builds there); never tracked
+**/.minarch-gl-build
 toolchains
 libretro-common
 libchdr
