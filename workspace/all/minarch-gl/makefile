@@ -34,7 +34,7 @@ TARGET      = minarch-gl
 UPSTREAM_SOURCE = minarch.c ma_cheats.c ma_rewind.c ma_audio.c ma_input.c \
 	ma_options.c ma_frontend_opts.c ma_saves.c ma_video.c ma_core.c ma_game.c \
 	ma_environment.c ma_config.c ma_menu.c ma_runframe.c \
-	../common/scaler.c ../common/utils.c ../common/config.c api.c \
+	../common/utils.c ../common/config.c api.c \
 	../common/notification.c ../../h700/platform/platform.c \
 	../common/http.c ../common/ra_badges.c ../common/ra_offline.c \
 	../common/ra_sync.c ../common/ra_event_queue.c ra_integration.c chd_reader.c \
