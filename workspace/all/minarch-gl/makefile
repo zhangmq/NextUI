@@ -37,7 +37,8 @@ UPSTREAM_SOURCE = minarch.c ma_cheats.c ma_rewind.c ma_audio.c ma_input.c \
 	../common/scaler.c ../common/utils.c ../common/config.c ../common/api.c \
 	../common/notification.c ../../h700/platform/platform.c \
 	../common/http.c ../common/ra_badges.c ../common/ra_offline.c \
-	../common/ra_sync.c ../common/ra_event_queue.c ra_integration.c chd_reader.c
+	../common/ra_sync.c ../common/ra_event_queue.c ra_integration.c chd_reader.c \
+	ma_present.c
 
 all:
 	rm -rf $(MERGED_DIR)
