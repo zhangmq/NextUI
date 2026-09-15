@@ -3,7 +3,8 @@
 // Picked up without overriding h700/platform/platform.c: that file does
 // `#include "generic_video.c"`, and the merged build's -I. finds this copy at
 // the tree root (quoted include: includer's dir first, then -I paths).
-// Change vs upstream: exactly TWO lines -- the ma_present.h include and
+// Change vs upstream: exactly THREE lines -- the ma_present.h include,
+// MA_present_init() after the context is current, and
 // PLAT_GL_Swap's swap, so the software path presents through MA_present like
 // the hardware path will.  Keep this diff hook-shaped.
 // ============================================================================
@@ -699,6 +700,7 @@ SDL_Surface* PLAT_initVideo(void) {
 		LOG_error("SDL_GL_CreateContext failed: %s\n", SDL_GetError());
 		exit(1);
 	}
+	MA_present_init(vid.window);   // our hook: capture window/EGL handles
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	glViewport(0, 0, w, h);
 
