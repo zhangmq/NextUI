@@ -7,6 +7,7 @@
 #include "ma_internal.h"
 #include "ma_options.h"
 #include "ma_config.h"
+#include "ma_preset.h"
 
 static ButtonMapping button_label_mapping[] = { // used to lookup the retro_id and local btn_id from button name
 	{"NONE",	-1,								BTN_ID_NONE},
@@ -370,24 +371,7 @@ void Config_init(void) {
 
 	// populate shader presets (minarch .cfg + RetroArch .glslp; P4)
 	// TODO: None option?
-	int preset_filecount = 0;
-	char** all_presets = list_files_in_folder(SHADERS_FOLDER, &preset_filecount, NULL, NULL);
-	char** preset_filelist = NULL;
-	if (all_presets) {
-		int kept = 0;
-		preset_filelist = malloc(sizeof(char*) * (preset_filecount + 1));
-		if (preset_filelist) {
-			for (int i = 0; i < preset_filecount; i++) {
-				const char* ext = strrchr(all_presets[i], '.');
-				if (!ext) continue;
-				if (strcasecmp(ext, ".cfg") && strcasecmp(ext, ".glslp")) continue;
-				preset_filelist[kept++] = all_presets[i]; // reuse the strdup'd names
-			}
-			preset_filelist[kept] = NULL;
-			free(all_presets); // only the array: the names are kept above
-		}
-	}
-	config.shaders.options[SH_SHADERS_PRESET].values = preset_filelist;
+	config.shaders.options[SH_SHADERS_PRESET].values = MA_preset_list(NULL);
 	
 	// populate shader options
 	// TODO: None option?
@@ -424,54 +408,6 @@ void Config_quit(void) {
 		free(core_button_mapping[i].name);
 	}
 }
-// Shader-pragma cfg values are numeric strings. The menu grid is built from
-// the shader's declared min/step, so a stored value that is not exactly on
-// the grid (older builds, other frontends, hand edits -- e.g. amp=1.24 on a
-// 0.05 grid) would make Option_getValueIndex fall through to slot 0, the
-// minimum. For scanlines amp the minimum is 0, which renders the whole
-// picture black. Match numerically instead: exact grid-string first, else
-// parse the stored value and pick the nearest in-range grid slot.
-static int shaderPragmaValueIndex(Option *option, const char *value) {
-	if (!option || !value) return 0;
-	if (option->values) {
-		for (int i = 0; option->values[i]; i++)
-			if (!strcmp(option->values[i], value)) return i;
-
-		int last = 0;
-		while (option->values[last]) last++;
-		last--;
-		if (last < 0) return 0;
-
-		float want = strtof(value, NULL);
-		float v0 = strtof(option->values[0], NULL);
-		float v1 = strtof(option->values[last], NULL);
-		if (want < v0) want = v0;
-		if (want > v1) want = v1;
-
-		int best = 0;
-		float bestd = 1e30f;
-		for (int i = 0; i <= last; i++) {
-			float vi = strtof(option->values[i], NULL);
-			float d = fabsf(want - vi);
-			if (d < bestd) { bestd = d; best = i; }
-		}
-		return best;
-	}
-	return 0;
-}
-
-// P4 non-UI path: the preset NAME stored in a per-core cfg, kept only when it
-// is an RA .glslp. A .cfg preset is flattened into the cfg by the menu (its
-// minarch_shaderN keys are already there) and is re-applied by initShaders'
-// option loop, so it needs no re-read; a .glslp is NOT flat and has to go
-// through the translator. readShadersPreset is otherwise reachable only from
-// the menu's Config_syncShaders, so without this a hand-written
-// `minarch_shaders_preset = foo.glslp` would be listed in the menu yet never
-// loaded. The RAW stored text is used (not option->value) because
-// Option_getValueIndex falls back to slot 0 for a name missing from the
-// scanned list, which would silently load an unrelated preset.
-static char glslp_preset_name[MAX_PATH] = {0};
-
 static void Config_readOptionsString(char* cfg) {
 	if (!cfg) return;
 
@@ -504,18 +440,13 @@ static void Config_readOptionsString(char* cfg) {
 		if (!Config_getValue(cfg, option->key, value, &option->lock)) continue;
 		OptionList_setOptionValue(&config.shaders, option->key, value);
 		// P4 non-UI path: remember an RA preset named by the cfg so
-		// initShaders() can load it (see glslp_preset_name above). If the same
-		// cfg also carries flattened minarch_shaderN keys, the menu already
-		// expanded the preset once and the stored (possibly edited) state must
-		// win -- that is what keeps a preset name "display only" the way
-		// upstream treats .cfg names.
+		// initShaders() can load it (ma_preset.c). A cfg that also carries
+		// flattened minarch_nrofshaders/shaderN keys already holds the
+		// expanded (possibly edited) state, so the name stays display-only.
 		if (!strcasecmp(option->key, "minarch_shaders_preset")) {
-			size_t vl = strlen(value);
-			if (vl > 6 && !strcasecmp(value + vl - 6, ".glslp")) {
-				char probe[64];
-				if (!Config_getValue(cfg, "minarch_nrofshaders", probe, NULL))
-					snprintf(glslp_preset_name, sizeof(glslp_preset_name), "%s", value);
-			}
+			char probe[64];
+			MA_preset_note_glslp(value,
+					Config_getValue(cfg, "minarch_nrofshaders", probe, NULL) != 0);
 		}
 	}
 	for (int y=0; y < config.shaders.options[SH_NROFSHADERS].value; y++) {
@@ -526,7 +457,7 @@ static void Config_readOptionsString(char* cfg) {
 				if (!Config_getValue(cfg, option->key, value, &option->lock)) continue;
 				// UI selection is grid-based; keep the nearest slot so the
 				// Extra Settings menu shows where the stored value sits.
-				option->value = shaderPragmaValueIndex(option, value);
+				option->value = MA_shaderpragma_value_index(option, value);
 				config.shaderpragmas[y].changed = 1;
 				// RA semantics (video_shader_parse.c video_shader_load_preset:
 				// config_get_float by parameter id): a stored parameter value
@@ -1019,8 +950,9 @@ void initShaders() {
 	// run BEFORE the option loop so the translated keys land on the options
 	// that the loop then pushes into the engine. A .cfg preset is skipped, as
 	// before: the menu already flattened its keys into the cfg.
-	if (glslp_preset_name[0])
-		readShadersPresetByName(glslp_preset_name);
+	const char *glslp = MA_preset_glslp_name();
+	if (glslp[0])
+		readShadersPresetByName(glslp);
 	for (int i=0; config.shaders.options[i].key; i++) {
 		if(i!=SH_SHADERS_PRESET) {
 			Option* option = &config.shaders.options[i];;
