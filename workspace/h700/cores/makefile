@@ -27,6 +27,7 @@ CORES+= prboom
 CORES+= bluemsx
 CORES+= gearcoleco
 CORES+= flycast
+CORES+= mupen64plus_next
 
 ###############################
 
@@ -153,6 +154,36 @@ flycast_MAKE = git submodule update --init --recursive core/deps/libchdr && \
 		-DCMAKE_C_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common" \
 		-DCMAKE_CXX_FLAGS="-fomit-frame-pointer -ffast-math -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a -fno-common -D_GNU_SOURCE" && \
 	cmake --build build-h700 --target flycast_libretro -- $(PROCS)
+
+
+# mupen64plus-next: Nintendo 64, GLES3 hardware render.  Chosen for H700 over
+# parallel-n64 after the 2026-09-16 survey: mupen64plus-next is the compatibility
+# leader on H700-class devices, while parallel-n64's ParaLLEl-RDP (LLE) is too
+# heavy for this SoC and only pays off for titles with severe graphics bugs.
+# ARCH/WITH_DYNAREC must be forced: the Makefile defaults ARCH to `uname -m`,
+# which is the x86_64 build host, not the target.  platform=unix + FORCE_GLES3=1
+# selects the GLES3 renderer (GL_LIB := -lGLESv2), i.e. the same libretro
+# hw-render path minarch-gl drives for flycast.
+mupen64plus_next_REPO = https://github.com/libretro/mupen64plus-libretro-nx
+# Pin recorded 2026-09-16 (develop HEAD at build time).
+mupen64plus_next_HASH = 6752836de8b224febfd5708444755b77712ac939
+# FRESH-CLONE CAVEAT (2026-09-16): upstream's develop tree carries gitlinks
+# (mupen64plus-rsp-paraLLEl, ...-video-paraLLEl) but ships no .gitmodules, so the
+# template's `git submodule update --init --recursive` aborts with "No url found for
+# submodule path .../lightning/gnulib".  Those trees are the Vulkan paraLLEl path and
+# are NOT needed for the GLES build.  Workaround: pre-clone once -- the template skips
+# its own clone step when the directory already exists --
+#   mkdir -p workspace/h700/cores/src && git clone --depth 1 \
+#     https://github.com/libretro/mupen64plus-libretro-nx workspace/h700/cores/src/mupen64plus_next
+#   ./workspace/h700/cores/src/mupen64plus_next && \
+#     git fetch --depth=1 origin $(mupen64plus_next_HASH) && git checkout $(HASH)
+#   make build-core PLATFORM=h700 CORE=mupen64plus_next
+mupen64plus_next_CORE = mupen64plus_next_libretro.so
+mupen64plus_next_MAKE = make platform=unix FORCE_GLES3=1 ARCH=aarch64 WITH_DYNAREC=aarch64
+# Top-level submodules only: the default `--recursive` update walks into
+# mupen64plus-rsp-paraLLEl's nested lightning/gnulib, which has no URL in its
+# own .gitmodules, and the whole clone fails (2026-09-16).
+mupen64plus_next_SUBMODULES = 
 
 ###############################
 
