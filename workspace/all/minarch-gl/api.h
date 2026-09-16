@@ -351,39 +351,10 @@ void GFX_flip(SDL_Surface* screen);
 // path calls GFX_frame_stats_display_only() (same window, current_fps left
 // alone).  Frame pacing is not here at all: it lives in the run loop
 // (pace_frame, minarch.c).
-// Present mode (hidden config key minarch_present / env MINARCH_PRESENT),
-// defined in generic_video.c (textually included from platform.c):
-//   MA_PRESENT_VSYNC: SDL_GL_SwapWindow.  The swap is the display's to time:
-//       the driver queues the flip to a vblank (tear-free) and blocks the
-//       caller only while the previous flip still owns a buffer.  On a driver
-//       that instead implements interval 1 as "sleep until the next vblank",
-//       this quantises a frame that misses the period to two periods.
-//   MA_PRESENT_ASYNC: raw eglSwapBuffers.  Never waits (measured ~8us) and the
-//       driver ignores the swap interval on this path, so production is never
-//       scheduled by the display at all -- the trade is a flip that is not
-//       aligned to a vblank (tearing) unless the driver queues it anyway.
-// The real "display always presents the newest frame, producer never waits"
-// arrangement needs a presenter on the main thread and the producer elsewhere;
-// that is the MA_PRESENT_MAILBOX mode, not implemented yet.
-extern int ma_present_mode;
-#define MA_PRESENT_VSYNC 0
-#define MA_PRESENT_ASYNC 1
-void PLAT_present_frame(void);
-// Set by PLAT_present_frame when the present itself blocked (the display paced
-// this frame); reset each loop iteration and read by pace_frame next to
-// ma_audio_wrote_frame.
-extern volatile int ma_present_blocked_frame;
-// Present-to-present gap distribution (see generic_video.c): <5ms gaps are
-// presents arriving ahead of the display.
-void PLAT_present_take_gap_stats(unsigned* n, uint64_t* min_us,
-		unsigned* lt5ms, unsigned* lt12ms, unsigned* lt20ms, unsigned* ge20ms);
-// Swap-call cost accounting for the frame-time logger (minarch.c). The point
-// is to see whether the display ever blocks the producer for a whole refresh
-// period: if it never does, this "vsync" is a buffered handoff -- the display
-// consumes the newest frame while the producer runs at its own rate, i.e. the
-// mailbox contract -- and a presenter thread would change nothing observable.
-void PLAT_present_take_stats(uint64_t* sum_us, uint64_t* max_us, unsigned* n,
-		unsigned* over_1ms, unsigned* over_half_period);
+// Present = one SDL swap (ma_present.h: MA_present_init/frame/blocked/take_stats);
+// the pacing owner lives in the run loop (pace_frame, minarch.c).  The
+// archive-era present-mode API (minarch_present key, the MA_PRESENT_* modes,
+// PLAT_present_frame and PLAT_present_take_*) went away with the async experiment.
 
 void PLAT_flipHidden();
 #define GFX_supportsOverscan PLAT_supportsOverscan // (void)
