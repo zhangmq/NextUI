@@ -513,6 +513,56 @@ static void ma_gl_present_draw(const GLfloat *coords) {
 // surfaces have row 0 at the TOP, so v runs top-down on screen; UVs span the
 // whole texture. The caller must have blending enabled (alpha compositing)
 // and the present program + VAO/VBO already bound.
+// Alpha-preserving passthrough program for the frontend's RGBA overlay
+// surfaces (Screen Effect, Overlay, hw-render debug HUD).  The present
+// program's fragment shader is RA's modern_opaque and forces alpha = 1 to keep
+// 32-bit game textures from going black, and its vertex shader applies uMvp to
+// already-clip-space vertices -- so overlay PNGs must NOT be drawn with it:
+// their transparency would be lost (an opaque rectangle over the game) and the
+// leftover uMvp would displace the quad.  Same contract as the software path's
+// s_pass_overlay (factory overlay.glsl): plain texture passthrough, alpha kept,
+// SRC_ALPHA blending.
+static const char *ma_gl_overlay_vs =
+	"#version 300 es\n"
+	"layout(location = 0) in vec2 aPos;\n"
+	"layout(location = 1) in vec2 aTex;\n"
+	"out vec2 vTex;\n"
+	"void main() { vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+static const char *ma_gl_overlay_fs =
+	"#version 300 es\n"
+	"precision mediump float;\n"
+	"in vec2 vTex;\n"
+	"uniform sampler2D uTex;\n"
+	"out vec4 fragColor;\n"
+	"void main() { fragColor = texture(uTex, vTex); }\n";
+static GLuint ma_gl_overlay_prog = 0;
+static GLint  ma_gl_overlay_tex_loc = -1;
+
+// Lazy program init (the GL context is current at every call site).  Draws
+// through the shared present VBO/attrib layout (locations 0/1) that
+// ma_gl_present_draw sets up.
+static void ma_gl_overlay_use(void) {
+	if (!ma_gl_overlay_prog) {
+		GLuint vs = ma_gl_compile_shader(GL_VERTEX_SHADER, ma_gl_overlay_vs);
+		GLuint fs = ma_gl_compile_shader(GL_FRAGMENT_SHADER, ma_gl_overlay_fs);
+		if (vs && fs) {
+			ma_gl_overlay_prog = glCreateProgram();
+			glAttachShader(ma_gl_overlay_prog, vs);
+			glAttachShader(ma_gl_overlay_prog, fs);
+			glBindAttribLocation(ma_gl_overlay_prog, 0, "aPos");
+			glBindAttribLocation(ma_gl_overlay_prog, 1, "aTex");
+			glLinkProgram(ma_gl_overlay_prog);
+			ma_gl_overlay_tex_loc = glGetUniformLocation(ma_gl_overlay_prog, "uTex");
+		}
+		if (vs) glDeleteShader(vs);
+		if (fs) glDeleteShader(fs);
+		if (!ma_gl_overlay_prog)
+			LOG_error("minarch: overlay shader link failed\n");
+	}
+	glUseProgram(ma_gl_overlay_prog);
+	if (ma_gl_overlay_tex_loc >= 0) glUniform1i(ma_gl_overlay_tex_loc, 0);
+}
+
 static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
 	float cx0 = 2.0f * x / DEVICE_WIDTH - 1.0f;
 	float cx1 = 2.0f * (x + w) / DEVICE_WIDTH - 1.0f;
@@ -528,16 +578,14 @@ static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
 	};
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, tex);
-	// The game path binds its FBO texture on unit 1 and points the sampler
-	// at it (RA set_params: texunit starts at 1). Overlay/debug textures
-	// live on unit 0, so re-point the sampler or the quad samples the game
-	// texture instead of this one.
-	if (ma_gl_present_tex_loc >= 0)
-		glUniform1i(ma_gl_present_tex_loc, 0);
-	// Same filter the software path sets on these textures (generic_video.c
-	// upload block): NEAREST.
+	// Own program, sampler and blend state (GL discipline: never inherit a
+	// binding).  The filter matches what the software path sets on these
+	// textures (generic_video.c upload block): NEAREST.
+	ma_gl_overlay_use();
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	ma_gl_present_draw(coords);
 }
 
@@ -793,6 +841,23 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	int fx_scale_h = dst_h / (height ? (int)height : 1);
 	int fx_scale = (fx_scale_w <= fx_scale_h) ? fx_scale_w : fx_scale_h;
 	if (fx_scale < 1) fx_scale = 1;
+	// The debug HUD prints the same renderer fields the software path fills in
+	// its frame callback (src dims/scale, dst rect); hw cores have no
+	// selectScaler step, so describe this present here.
+	{
+		int cw = GFX_shaders_active() ? ma_gl_chain_w : (int)width;
+		int ch = GFX_shaders_active() ? ma_gl_chain_h : (int)height;
+		int sc = (cw > 0) ? dst_w / cw : 1;
+		renderer.src_w = cw;
+		renderer.src_h = ch;
+		renderer.src_x = 0;
+		renderer.src_y = 0;
+		renderer.scale = (sc < 1) ? 1 : sc;
+		renderer.dst_x = dst_x;
+		renderer.dst_y = dst_y;
+		renderer.dst_w = dst_w;
+		renderer.dst_h = dst_h;
+	}
 	GFX_setEffectScale(fx_scale);
 	GFX_prepare_overlay_textures();
 	// The shader chain runs on its own program (VAO 0 global attribs) and
@@ -921,323 +986,70 @@ void MA_GL_context_destroy(void) {
 }
 
 // ---------------------------------------------------------------------------
-// GL hw-render debug HUD (flycast etc.): the software drawDebugHud only runs
-// on CPU-frame video callbacks, which hw-render cores never deliver. Mirror
-// the same perf text as one MangoHud-style line, rendered with the frontend's
-// TTF font (font.tiny = 20 px) on a translucent black panel.
+// hw-render debug HUD (flycast etc.).  hw-render cores never deliver a CPU
+// frame, and minarch's original HUD (ma_video.c PLAT_draw_debug_hud) stamps
+// its bitmap text into exactly such a frame -- so the SAME function runs here,
+// onto a frontend RGBA surface, and the result is composited as one more
+// overlay quad through ma_gl_draw_overlay_quad.  No second HUD implementation,
+// no TTF panel and no seqlock handoff.
 //
-// Threading (SDL_ttf is not thread-safe and the minarch notification/menu
-// rendering uses it on the main thread): the text is rasterized on the MAIN
-// loop thread (MA_GL_hud_update, called from minarch.c where the perf stats
-// are also sampled) and published to the core's video callback thread
-// (MA_GL_video_refresh -> ma_gl_draw_debug_hud) lock-free via a seqlock, so
-// the video thread only samples a complete buffer and never waits. It uploads
-// that buffer and draws the quad, never touching SDL_ttf.
-//
-// Alpha: the panel is translucent, so it is NOT drawn with ma_gl_present_prog
-// (that shader forces alpha = 1, RA modern_opaque, to keep game textures from
-// going black). ma_gl_hud_prog is a plain texture pass that keeps the alpha
-// channel (same semantics as the effect/overlay notification shader
-// overlay.glsl) and relies on the SRC_ALPHA blend already enabled.
+// It is rasterized on the core's video thread, which is where the software
+// path runs the same function (upstream calls drawDebugHud from the video
+// callback), so the threading model and the globals it reads (perf, renderer)
+// are unchanged.  Half device resolution on a fullscreen quad reproduces the
+// ~2x apparent text size the software path gets from its integer upscale.
 // ---------------------------------------------------------------------------
-#define MA_GL_HUD_MAX_W 700
-#define MA_GL_HUD_MAX_H 44
-#define MA_GL_HUD_PAD 8
-#define MA_GL_HUD_BG 0x99000000u // ABGR8888: A=0x99 black, translucent
-// Lock-free single-producer/single-consumer handoff: the main thread
-// rasterizes the panel into ma_gl_hud_buf, the video thread uploads it. A
-// seqlock (even = stable, odd = a write is in progress) lets the consumer
-// detect a race and re-upload, so neither thread ever waits on the other --
-// the video thread only samples a buffer it observed to be complete.
-static uint32_t ma_gl_hud_buf[MA_GL_HUD_MAX_W * MA_GL_HUD_MAX_H];
-static volatile unsigned ma_gl_hud_seq = 0;  // seqlock: odd while writing
-static volatile int ma_gl_hud_w = 0;
-static volatile int ma_gl_hud_h = 0;
-static volatile int ma_gl_hud_uploaded = 0; // a valid texture exists on GPU
-static unsigned ma_gl_hud_uploaded_seq = 0; // consumer-local: last seq uploaded
-static int ma_gl_hud_up_w = 0;              // consumer-local: uploaded panel size
-static int ma_gl_hud_up_h = 0;
+static uint32_t *ma_gl_hud_surface = NULL;
+static int ma_gl_hud_w = 0, ma_gl_hud_h = 0;
 static GLuint ma_gl_hud_tex = 0;
-static GLuint ma_gl_hud_prog = 0;
-static GLint ma_gl_hud_tex_loc = -1;
+static int ma_gl_hud_tex_sized = 0;
 
-static const char *ma_gl_hud_vs =
-	"#version 300 es\n"
-	"layout(location = 0) in vec2 aPos;\n"
-	"layout(location = 1) in vec2 aTex;\n"
-	"out vec2 vTex;\n"
-	"void main() { vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
-// Alpha-preserving passthrough: keep the surface's alpha (translucent panel
-// + opaque glyphs) for SRC_ALPHA compositing over the game frame.
-static const char *ma_gl_hud_fs =
-	"#version 300 es\n"
-	"precision mediump float;\n"
-	"in vec2 vTex;\n"
-	"uniform sampler2D uTex;\n"
-	"out vec4 fragColor;\n"
-	"void main() { fragColor = texture(uTex, vTex); }\n";
-
-// Frame statistics for the hw-render debug HUD, called on the MAIN thread
-// once per frame (minarch.c). Self-contained on purpose: it keeps its own
-// timestamp and rolling window and writes ONLY the perf fields the HUD
-// displays. It must never write current_fps -- that variable is the SOFTWARE
-// paths' audio resample denominator (SND_batchSamples divides by it), and
-// feeding it from this hw-render loop made the audio pitch follow the
-// frontend loop rate.
-#define MA_GL_HUD_STATS_WINDOW 50
-void MA_GL_hud_stats_tick(void) {
-	if (!MA_GL_is_active() || !show_debug) return;
-
-	static uint64_t last_counter = 0;
-	static double   fps_history[MA_GL_HUD_STATS_WINDOW];
-	static double    ms_history[MA_GL_HUD_STATS_WINDOW];
-	static int      history_index = 0;
-	static int      history_count = 0;
-
-	uint64_t now = SDL_GetPerformanceCounter();
-	if (!last_counter) { last_counter = now; return; }
-
-	double ms = (double)(now - last_counter) * 1000.0
-			/ (double)SDL_GetPerformanceFrequency();
-	last_counter = now;
-
-	// Ignore nonsense intervals (a 1 s gap is far beyond any frame time we
-	// care about); they would otherwise poison the whole window.
-	if (ms <= 0.0 || ms > 1000.0) return;
-
-	fps_history[history_index] = 1000.0 / ms;
-	ms_history[history_index]  = ms;
-	history_index = (history_index + 1) % MA_GL_HUD_STATS_WINDOW;
-	if (history_count < MA_GL_HUD_STATS_WINDOW) history_count++;
-
-	double fps_sum = 0.0, ms_sum = 0.0, ms_max = 0.0;
-	for (int i = 0; i < history_count; i++) {
-		fps_sum += fps_history[i];
-		ms_sum  += ms_history[i];
-		if (ms_history[i] > ms_max) ms_max = ms_history[i];
-	}
-	perf.fps          = fps_sum / history_count;
-	perf.avg_frame_ms = ms_sum / history_count;
-	perf.max_frame_ms = ms_max;
-}
-
-// Called on the MAIN thread once per frame (minarch.c, same place the perf
-// stats tick runs). Rasterizes the HUD line with font.tiny (20 px) onto a
-// translucent black ABGR8888 panel and publishes it to the shared buffer
-// (seqlock, no lock). Re-renders only when the text changed (throttled).
-void MA_GL_hud_update(void) {
-	// Both present paths feed the same perf fields (hw: MA_GL_hud_stats_tick,
-	// software: the GFX_*_Swap frame_stats_sample), so the HUD is no longer
-	// hw-render-only.
-	if (!show_debug) return;
-	if (SDL_GetTicks() < 5000) return; // mirror software HUD warm-up gate
-	if (!font.tiny) return;
-	if (isnan(perf.fps) || isnan(perf.avg_frame_ms)
-			|| isnan(perf.max_frame_ms)) return;
-
-	char fps_txt[16], rest[224];
-	// MangoHud-ish single line: measured fps (labelled), avg frame time, CPU
-	// (usage/speed/temp), GPU (usage/speed/temp). No requested/target fps:
-	// the core reports the board's video rate (flycast always says 59.94 for
-	// NTSC), not the rate the game actually submits frames at, so a 30 fps
-	// title reads "30/60" and looks like a fault that isn't there. The labelled
-	// value is no wider than the old pair, so the line still fits the 704 px
-	// available at 20 px on the 720 px screen and never wraps or clips.
-	sprintf(fps_txt, "fps: %.0f", perf.fps);
-	sprintf(rest, " %.0fms CPU: %d%% %dMHz %d\u00b0C GPU: %d%% %dMHz %d\u00b0C",
-		perf.avg_frame_ms,
-		(int)(perf.cpu_usage + 0.5), perf.cpu_speed, perf.cpu_temp,
-		(int)(perf.gpu_usage + 0.5), perf.gpu_speed, perf.gpu_temp);
-
-	// Throttle: re-rasterize at most ~10x/second AND only when the line
-	// actually changed (the fps digits move constantly, so change alone
-	// would re-render every frame for no visible benefit).
-	static uint32_t last_render_ticks = 0;
-	static char last_text[256] = "";
-	uint32_t now = SDL_GetTicks();
-	if (now - last_render_ticks < 100)
-		return;
-	{
-		char full[256];
-		snprintf(full, sizeof(full), "%s%s", fps_txt, rest);
-		if (strcmp(full, last_text) == 0)
-			return;
-		strncpy(last_text, full, sizeof(last_text) - 1);
-	}
-	last_render_ticks = now;
-
-	// One plain colour for the whole line. The old green/amber/red judgement
-	// compared the measured fps with the core's nominal rate -- the very value
-	// that turned out not to be meaningful for this HUD (see above), and one
-	// that paints a 30 fps title red. Panel background is painted translucent
-	// black by the caller.
-	SDL_Color body_col = { 215, 215, 215, 255 };
-	SDL_Color fps_col = body_col;
-
-	// Measure each part so the body starts right after the fps value.
-	int fps_w = 0, body_w = 0;
-	TTF_SizeUTF8(font.tiny, fps_txt, &fps_w, NULL);
-	TTF_SizeUTF8(font.tiny, rest, &body_w, NULL);
-
-	int text_h = 0;
-	TTF_SizeUTF8(font.tiny, "Ag", NULL, &text_h); // ~cap height
-	int panel_w = fps_w + body_w + MA_GL_HUD_PAD * 2;
-	int panel_h = text_h + MA_GL_HUD_PAD;
-	if (panel_w > MA_GL_HUD_MAX_W) panel_w = MA_GL_HUD_MAX_W;
-	if (panel_h > MA_GL_HUD_MAX_H) panel_h = MA_GL_HUD_MAX_H;
-
-	// ABGR8888 memory byte order is R,G,B,A (little endian), which is exactly
-	// what glTexImage2D(GL_RGBA) expects -- same convention as the in-game
-	// notification overlay (notification.c + generic_video.c notif upload).
-	SDL_Surface *panel = SDL_CreateRGBSurfaceWithFormat(
-		0, panel_w, panel_h, 32, SDL_PIXELFORMAT_ABGR8888);
-	if (!panel) return;
-
-	// Translucent black background.
-	SDL_FillRect(panel, NULL, MA_GL_HUD_BG);
-
-	// Composite fps value then the body (each surface carries its own alpha).
-	SDL_Rect dst = { MA_GL_HUD_PAD, MA_GL_HUD_PAD / 2, 0, 0 };
-	SDL_Surface *fps_surf = TTF_RenderUTF8_Blended(font.tiny, fps_txt, fps_col);
-	if (fps_surf) {
-		dst.w = fps_surf->w; dst.h = fps_surf->h;
-		SDL_SetSurfaceBlendMode(fps_surf, SDL_BLENDMODE_BLEND);
-		SDL_BlitSurface(fps_surf, NULL, panel, &dst);
-		SDL_FreeSurface(fps_surf);
-	}
-	SDL_Surface *body_surf = TTF_RenderUTF8_Blended(font.tiny, rest, body_col);
-	if (body_surf) {
-		dst.x = MA_GL_HUD_PAD + fps_w;
-		dst.w = body_surf->w; dst.h = body_surf->h;
-		SDL_SetSurfaceBlendMode(body_surf, SDL_BLENDMODE_BLEND);
-		SDL_BlitSurface(body_surf, NULL, panel, &dst);
-		SDL_FreeSurface(body_surf);
-	}
-
-	// Publish lock-free under a seqlock: the odd seq marks the write in
-	// progress, the release store of the even seq publishes the pixels and the
-	// panel size together. The consumer re-uploads if it observes the change.
-	__atomic_add_fetch(&ma_gl_hud_seq, 1, __ATOMIC_ACQ_REL);
-	memset(ma_gl_hud_buf, 0, sizeof(ma_gl_hud_buf));
-	for (int y = 0; y < panel_h; y++)
-		memcpy(ma_gl_hud_buf + y * MA_GL_HUD_MAX_W,
-			(uint32_t *)panel->pixels + y * panel_w, panel_w * 4);
-	ma_gl_hud_w = panel_w;
-	ma_gl_hud_h = panel_h;
-	__atomic_add_fetch(&ma_gl_hud_seq, 1, __ATOMIC_RELEASE);
-
-	SDL_FreeSurface(panel);
-}
-
-// Upload the panel text produced by MA_GL_hud_update (only when it changed)
-// and draw it top-left EVERY frame. Runs after the game frame was presented,
-// before the swap (RA draws its widgets in the same spot of the driver frame
-// callback). Drawing every frame while uploading only on change is what keeps
-// the HUD stable -- gating the draw itself on the dirty flag made the panel
-// flicker (present only on the frames the text changed, invisible the rest).
-//
-// Shared by BOTH present paths: the hw-render path calls it from
-// MA_GL_video_refresh, the software path from PLAT_GL_Swap. The draw is fully
-// self-contained (own program, full-screen viewport, FBO 0, own blend state),
-// so it does not depend on either path's leftover state.
-void PLAT_draw_debug_hud(void) {
+static void ma_gl_draw_debug_hud(void) {
 	if (!show_debug || SDL_GetTicks() < 5000) return;
 
-	// Lazy program init (GL context is current here).
-	if (!ma_gl_hud_prog) {
-		GLuint vs = ma_gl_compile_shader(GL_VERTEX_SHADER, ma_gl_hud_vs);
-		GLuint fs = ma_gl_compile_shader(GL_FRAGMENT_SHADER, ma_gl_hud_fs);
-		if (vs && fs) {
-			ma_gl_hud_prog = glCreateProgram();
-			glAttachShader(ma_gl_hud_prog, vs);
-			glAttachShader(ma_gl_hud_prog, fs);
-			glBindAttribLocation(ma_gl_hud_prog, 0, "aPos");
-			glBindAttribLocation(ma_gl_hud_prog, 1, "aTex");
-			glLinkProgram(ma_gl_hud_prog);
-			ma_gl_hud_tex_loc = glGetUniformLocation(ma_gl_hud_prog, "uTex");
-		}
-		if (vs) glDeleteShader(vs);
-		if (fs) glDeleteShader(fs);
-		if (!ma_gl_hud_prog)
-			LOG_error("minarch: hud shader link failed\n");
+	int w = DEVICE_WIDTH / 2, h = DEVICE_HEIGHT / 2;
+	if (w <= 0 || h <= 0) return;
+	if (!ma_gl_hud_surface || ma_gl_hud_w != w || ma_gl_hud_h != h) {
+		free(ma_gl_hud_surface);
+		ma_gl_hud_surface = calloc((size_t)w * (size_t)h, 4);
+		ma_gl_hud_w = w;
+		ma_gl_hud_h = h;
+		ma_gl_hud_tex_sized = 0;
 	}
-	if (!ma_gl_hud_prog) return;
+	if (!ma_gl_hud_surface) return;
 
-	if (!ma_gl_hud_tex)
+	// Transparent background: the HUD's black text boxes and white glyphs are
+	// opaque, everything else blends through to the game frame.
+	memset(ma_gl_hud_surface, 0, (size_t)w * (size_t)h * 4);
+	PLAT_draw_debug_hud(ma_gl_hud_surface, (unsigned)w, (unsigned)h,
+			(size_t)w * 4, RETRO_PIXEL_FORMAT_XRGB8888);
+
+	if (!ma_gl_hud_tex) {
 		glGenTextures(1, &ma_gl_hud_tex);
-	if (!ma_gl_hud_tex) return;
-
-	// Upload a newly published panel, lock-free: read the seqlock, upload, and
-	// re-upload if the producer wrote meanwhile (it publishes at most ~10x/s,
-	// so a race is rare). Nothing here ever waits for the main thread. Texture
-	// storage is fixed at MAX_W x MAX_H (the panel is the top-left sub-rect);
-	// 700x44 RGBA is ~123 KB and this only runs when the text changed.
-	for (int attempt = 0; attempt < 4; attempt++) {
-		unsigned seq = __atomic_load_n(&ma_gl_hud_seq, __ATOMIC_ACQUIRE);
-		if (seq == ma_gl_hud_uploaded_seq) break; // nothing new to upload
-		if (seq & 1) continue;                    // writer mid-update: retry
-
-		int nw = ma_gl_hud_w, nh = ma_gl_hud_h;
-		if (nw <= 0 || nh <= 0) break;
-
-		glBindTexture(GL_TEXTURE_2D, ma_gl_hud_tex);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MA_GL_HUD_MAX_W, MA_GL_HUD_MAX_H,
-			0, GL_RGBA, GL_UNSIGNED_BYTE, ma_gl_hud_buf);
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		if (__atomic_load_n(&ma_gl_hud_seq, __ATOMIC_ACQUIRE) != seq)
-			continue; // raced with a publish: upload the newer panel
-
-		ma_gl_hud_uploaded_seq = seq;
-		ma_gl_hud_up_w = nw;
-		ma_gl_hud_up_h = nh;
-		ma_gl_hud_uploaded = 1;
-		break;
+		if (!ma_gl_hud_tex) return;
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, ma_gl_hud_tex);
+	if (!ma_gl_hud_tex_sized) {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+				GL_UNSIGNED_BYTE, ma_gl_hud_surface);
+		ma_gl_hud_tex_sized = 1;
+	} else {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA,
+				GL_UNSIGNED_BYTE, ma_gl_hud_surface);
 	}
 
-	// Draw only once a texture is on the GPU; keep drawing every frame with the
-	// last uploaded panel size (the loop above consumed any pending change).
-	if (!ma_gl_hud_uploaded) return;
-	const int w = ma_gl_hud_up_w, h = ma_gl_hud_up_h;
-	if (!w || !h) return;
-
-	// Draw: NDC/clip-space vertices for the panel sub-rect (top-left,
-	// w x h screen pixels), alpha-preserving shader, upright screen space --
-	// NOT rotated with the game (RA's widgets draw after the final pass with
-	// their own full-screen viewport and never inherit the core's rotation
-	// MVP). Viewport is the full screen, and this shader has no MVP at all.
+	// Own draw state, then the shared overlay quad (which brings its own
+	// program, filter and blend function).
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_STENCIL_TEST);
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glUseProgram(ma_gl_hud_prog);
-	if (ma_gl_hud_tex_loc >= 0)
-		glUniform1i(ma_gl_hud_tex_loc, 0);
-
-	// UVs sample the panel's sub-rect of the fixed MAX texture: row 0 of the
-	// ABGR surface (image top) sits at v = 0, so screen top -> v = 0.
-	float uw = (float)w / MA_GL_HUD_MAX_W;
-	float uh = (float)h / MA_GL_HUD_MAX_H;
-	const int x = 2, y = 2; // top-left margin
-	float cx0 = 2.0f * x / DEVICE_WIDTH - 1.0f;
-	float cx1 = 2.0f * (x + w) / DEVICE_WIDTH - 1.0f;
-	float cy0 = 1.0f - 2.0f * (y + h) / DEVICE_HEIGHT; // bottom
-	float cy1 = 1.0f - 2.0f * y / DEVICE_HEIGHT;       // top
-	float coords[16] = {
-		cx0, cy0,  cx1, cy0,  cx0, cy1,  cx1, cy1,  // vertex
-		0.f,  uh,  uw,  uh,   0.f, 0.f,  uw, 0.f,   // texcoord
-	};
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, ma_gl_hud_tex);
-	ma_gl_present_draw(coords);
+	ma_gl_draw_overlay_quad(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, ma_gl_hud_tex);
 }
+
 
 void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
 	if (!hw_render_active) return;
@@ -1299,7 +1111,7 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	ma_gl_present_quad(width, height);
 	// Composite the HUD in the same place RA draws its widgets: end of the
 	// driver frame.
-	PLAT_draw_debug_hud();
+	ma_gl_draw_debug_hud();
 	{
 		uint64_t us = (SDL_GetPerformanceCounter() - mg_t0) * 1000000ull / (mg_freq ? mg_freq : 1);
 		mg_draw_us_sum += us;
@@ -1336,6 +1148,11 @@ void MA_GL_present_from_loop(void) {
 	SDL_GLContext ctx = PLAT_getGLContext();
 	if (!win || !ctx) return;
 	SDL_GL_MakeCurrent(win, ctx);
+	// Debug HUD statistics for the hw path: minarch's original sampler with
+	// current_fps left alone (SND_batchSamples resamples core audio by it and
+	// must keep tracking the audio clock, not this loop).  Sampled here
+	// because this is the hw path's once-per-frame loop point.
+	if (show_debug) GFX_frame_stats_display_only(core.fps);
 	MA_present_frame();
 }
 

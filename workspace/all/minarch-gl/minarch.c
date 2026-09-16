@@ -283,33 +283,11 @@ int main(int argc , char* argv[]) {
 		// Measurement only (MINARCH_FRAME_LOG); see frame_histogram_tick.
 		MA_telemetry_tick();
 
-		// GL hw-render debug HUD: the present paths' statistics sampler
-		// (GFX_flip/GFX_GL_Swap) never runs for hw-render cores, and its
-		// current_fps must NOT be fed from this loop either -- current_fps is
-		// the audio resample denominator, and writing it here made the audio
-		// pitch follow the main-loop rate. MA_GL_hud_stats_tick keeps its own
-		// state and fills only the perf display fields.
-		//
-		// The CPU/GPU telemetry is polled on this (main) thread -- not on the
-		// core's render thread -- once per frame while the HUD is shown;
-		// perf.cpu_usage comes from the separate CPU monitor thread
-		// (updateCPUMonitor), enabled together with show_debug. The TTF text
-		// rasterization (MA_GL_hud_update) also stays here because the
-		// notification/menu code uses the same font objects on this thread;
-		// the video-callback thread only uploads and draws the panel.
-		if (show_debug) {
-			// Only the hw-render path needs its own frame-stats sampler; the
-			// software paths already fill perf.fps/avg/max from their present
-			// sampler (feeding MA_GL_hud_stats_tick there would double-count).
-			if (MA_GL_is_active())
-				MA_GL_hud_stats_tick();
-			PLAT_getCPUTemp();
-			PLAT_getCPUSpeed();
-			PLAT_getGPUTemp();
-			PLAT_getGPUSpeed();
-			PLAT_getGPUUsage();
-			MA_GL_hud_update();
-		}
+		// The debug HUD is minarch's original one: the software path stamps it
+		// into the core frame (ma_video.c), the hw-render path rasterizes the
+		// same function onto a frontend surface in its present callback, and
+		// both poll the CPU/GPU telemetry from inside drawDebugHud -- exactly
+		// where upstream does.  Nothing to drive from the main loop.
 		
 		// Process RetroAchievements for this frame
 		RA_doFrame();

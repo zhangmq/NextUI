@@ -2079,10 +2079,9 @@ void PLAT_GL_Swap() {
 			notif.x, notif.y, notif.tex_w, notif.tex_h,
 			NULL, 0, 1);
     }
-	// Composite the debug HUD in the same place RA draws its widgets: end of
-	// the frame, before the swap. Same call the hw-render path makes, and the
-	// software HUD's bitmap text is gone (P3).
-	PLAT_draw_debug_hud();
+	// The debug HUD is minarch's original one and is stamped into the core
+	// frame in ma_video.c (upstream call site), so it is already part of the
+	// texture this function just presented -- nothing to composite here.
 
 	MA_present_frame();
 

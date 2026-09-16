@@ -48,6 +48,477 @@ static void screen_flip(SDL_Surface* screen) {
 	GFX_GL_Swap();
 }
 
+static const char* bitmap_font[] = {
+	['0'] = 
+		" 111 "
+		"1   1"
+		"1   1"
+		"1  11"
+		"1 1 1"
+		"11  1"
+		"1   1"
+		"1   1"
+		" 111 ",
+	['1'] =
+		"   1 "
+		" 111 "
+		"   1 "
+		"   1 "
+		"   1 "
+		"   1 "
+		"   1 "
+		"   1 "
+		"   1 ",
+	['2'] =
+		" 111 "
+		"1   1"
+		"    1"
+		"   1 "
+		"  1  "
+		" 1   "
+		"1    "
+		"1    "
+		"11111",
+	['3'] =
+		" 111 "
+		"1   1"
+		"    1"
+		"    1"
+		" 111 "
+		"    1"
+		"    1"
+		"1   1"
+		" 111 ",
+	['4'] =
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"11111"
+		"    1"
+		"    1",
+	['5'] =
+		"11111"
+		"1    "
+		"1    "
+		"1111 "
+		"    1"
+		"    1"
+		"    1"
+		"1   1"
+		" 111 ",
+	['6'] =
+		" 111 "
+		"1    "
+		"1    "
+		"1111 "
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		" 111 ",
+	['7'] =
+		"11111"
+		"    1"
+		"    1"
+		"   1 "
+		"  1  "
+		"  1  "
+		"  1  "
+		"  1  "
+		"  1  ",
+	['8'] =
+		" 111 "
+		"1   1"
+		"1   1"
+		"1   1"
+		" 111 "
+		"1   1"
+		"1   1"
+		"1   1"
+		" 111 ",
+	['9'] =
+		" 111 "
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		" 1111"
+		"    1"
+		"    1"
+		" 111 ",
+	['.'] = 
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		" 11  "
+		" 11  ",
+	[','] = 
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"  1  "
+		"  1  "
+		" 1   ",
+	[' '] = 
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     "
+		"     ",
+	['('] = 
+		"   1 "
+		"  1  "
+		" 1   "
+		" 1   "
+		" 1   "
+		" 1   "
+		" 1   "
+		"  1  "
+		"   1 ",
+	[')'] = 
+		" 1   "
+		"  1  "
+		"   1 "
+		"   1 "
+		"   1 "
+		"   1 "
+		"   1 "
+		"  1  "
+		" 1   ",
+	['/'] = 
+		"   1 "
+		"   1 "
+		"   1 "
+		"  1  "
+		"  1  "
+		"  1  "
+		" 1   "
+		" 1   "
+		" 1   ",
+	['x'] = 
+		"     "
+		"     "
+		"1   1"
+		"1   1"
+		" 1 1 "
+		"  1  "
+		" 1 1 "
+		"1   1"
+		"1   1",
+	['%'] = 
+		" 1   "
+		"1 1  "
+		"1 1 1"
+		" 1 1 "
+		"  1  "
+		" 1 1 "
+		"1 1 1"
+		"  1 1"
+		"   1 ",
+	['-'] =
+		"     "
+		"     "
+		"     "
+		"     "
+		" 111 "
+		"     "
+		"     "
+		"     "
+		"     ",
+	['c'] = 
+        "     "
+        "     "
+        " 111 "
+        "1   1"
+        "1    "
+        "1    "
+        "1    "
+        "1   1"
+        " 111 ",
+	['m'] = 
+        "     "
+        "     "
+        "11 11"
+        "1 1 1"
+        "1 1 1"
+        "1   1"
+        "1   1"
+        "1   1"
+        "1   1",
+	['z'] =
+		"     "
+        "     "
+        "     "
+        "11111"
+        "   1 "
+        "  1  "
+        " 1   "
+        "1    "
+        "11111",
+	['h'] =
+		"     "
+        "1    "
+        "1    "
+        "1    "
+        "1111 "
+        "1   1"
+        "1   1"
+        "1   1"
+        "1   1",
+	['D'] = 
+		"1111 "
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1111 ",
+	['J'] = 
+		"  111"
+		"    1"
+		"    1"
+		"    1"
+		"    1"
+		"1   1"
+		"1   1"
+		"1   1"
+		" 111 ",
+	['A'] = 
+		"  1  "
+		" 1 1 "
+		"1   1"
+		"1   1"
+		"11111"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1",
+	['M'] = 
+		"1   1"
+		"11 11"
+		"1 1 1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1",
+	[':'] = 
+		"     "
+		"     "
+		"  1  "
+		"     "
+		"     "
+		"     "
+		"  1  "
+		"     "
+		"     ",
+	['B'] = 
+		"1111 "
+		"1   1"
+		"1   1"
+		"1111 "
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1111 ",
+	['C'] = 
+		" 111 "
+		"1   1"
+		"1    "
+		"1    "
+		"1    "
+		"1    "
+		"1    "
+		"1   1"
+		" 111 ",
+	['N'] = 
+		"1   1"
+		"1   1"
+		"11  1"
+		"1   1"
+		"1 1 1"
+		"1   1"
+		"1  11"
+		"1   1"
+		"1   1",
+	['H'] = 
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1"
+		"11111"
+		"1   1"
+		"1   1"
+		"1   1"
+		"1   1",
+};
+
+void drawRect(int x, int y, int w, int h, uint32_t c, uint32_t *data, int stride) {
+	for (int _x = x; _x < x + w; _x++) {
+		data[_x + y * stride] = c;
+		data[_x + (y + h - 1) * stride] = c;
+	}
+	for (int _y = y; _y < y + h; _y++) {
+		data[x + _y * stride] = c;
+		data[x + w - 1 + _y * stride] = c;
+	}
+}
+
+void fillRect(int x, int y, int w, int h, uint32_t c, uint32_t *data, int stride) {
+	for (int _y = y; _y < y + h; _y++) {
+		for (int _x = x; _x < x + w; _x++) {
+			data[_x + _y * stride] = c;
+		}
+	}
+}
+
+static void blitBitmapText(char* text, int ox, int oy, uint32_t* data, int stride, int width, int height) {
+	#define DEBUG_CHAR_WIDTH 5
+	#define DEBUG_CHAR_HEIGHT 9
+	#define LETTERSPACING 1
+
+	int len = strlen(text);
+	int w = ((DEBUG_CHAR_WIDTH + LETTERSPACING) * len) - 1;
+	int h = DEBUG_CHAR_HEIGHT;
+
+	if (ox < 0) ox = width - w + ox;
+	if (oy < 0) oy = height - h + oy;
+
+	if (ox < 0) ox = 0;
+	if (oy < 0) oy = 0;
+
+	// Clamp to screen bounds (optional but recommended)
+	if (ox + w > width) w = width - ox;
+	if (oy + h > height) h = height - oy;
+
+	if (w <= 0 || h <= 0) return;
+
+	// Draw background rectangle (black ARGB8888)
+	fillRect(ox, oy, w, h, 0xFF000000, data, stride);
+
+	data += oy * stride + ox;
+
+	for (int y = 0; y < h; y++) {
+		// uint32_t* row = data + y * stride;
+		int current_x = 0;
+		for (int i = 0; i < len; i++) {
+			const char* c = bitmap_font[(unsigned char)text[i]];
+			if (!c) c = bitmap_font[' '];
+			for (int x = 0; x < DEBUG_CHAR_WIDTH; x++) {
+				if (current_x >= w) break;
+
+				if (c[y * DEBUG_CHAR_WIDTH + x] == '1') {
+					data[y * stride + current_x] = 0xFFFFFFFF;  // white ARGBB8888
+				}
+				current_x++;
+			}
+			if (current_x >= w) break;
+			current_x += LETTERSPACING;
+		}
+	}
+}
+
+void drawGauge(int x, int y, float percent, int width, int height, uint32_t *data, int stride) {
+	// Clamp percent to 0.0 - 1.0
+	if (percent < 0.0f) percent = 0.0f;
+	if (percent > 1.0f) percent = 1.0f;
+
+	uint8_t red   = (uint8_t)(percent * 255.0f);
+	uint8_t green = (uint8_t)((1.0f - percent) * 255.0f);
+	uint8_t blue  = 0;
+	uint8_t alpha = 255;
+
+	uint32_t fillColor = (red << 24) | (green << 16) | (blue << 8) | alpha;
+	uint32_t borderColor = 0xFFFFFFFF;  // White ARGB
+	uint32_t bgColor = 0xFF000000;      // Black ARGB
+
+	// Background
+	fillRect(x, y, width, height, bgColor, data, stride);
+
+	// Filled portion
+	int filledWidth = (int)(percent * width);
+	fillRect(x, y, filledWidth, height, fillColor, data, stride);
+
+	// Outline
+	drawRect(x, y, width, height, borderColor, data, stride);
+}
+
+static void drawDebugHud(const void* data, unsigned width, unsigned height, size_t pitch, enum retro_pixel_format fmt)
+{
+	if (show_debug && !isnan(perf.ratio) && !isnan(perf.fps) && !isnan(perf.req_fps)  && !isnan(perf.buffer_ms) &&
+		perf.buffer_size >= 0  && perf.buffer_free >= 0 && SDL_GetTicks() > 5000) {
+		int x = 2 + renderer.src_x;
+		int y = 2 + renderer.src_y;
+		char debug_text[250];
+		int scale = renderer.scale;
+		if (scale==-1) scale = 1; // nearest neighbor flag
+
+		sprintf(debug_text, "%ix%i %ix %i/%i", renderer.src_w,renderer.src_h, scale,perf.samplerate_in,perf.samplerate_out);
+		blitBitmapText(debug_text,x,y,(uint32_t*)data,pitch / 4, width,height);
+		
+		sprintf(debug_text, "%.03f/%i/%.0f/%i/%i/%i", perf.ratio,
+				perf.buffer_size,perf.buffer_ms, perf.buffer_free, perf.buffer_target,perf.avg_buffer_free);
+		blitBitmapText(debug_text, x, y + 14, (uint32_t*)data, pitch / 4, width,
+					height);
+
+		sprintf(debug_text, "%i,%i %ix%i", renderer.dst_x,renderer.dst_y, renderer.src_w*scale,renderer.src_h*scale);
+		blitBitmapText(debug_text,-x,y,(uint32_t*)data,pitch / 4, width,height);
+	
+		sprintf(debug_text, "%ix%i,%i", renderer.dst_w,renderer.dst_h, fmt == RETRO_PIXEL_FORMAT_XRGB8888 ? 8888 : 565);
+		blitBitmapText(debug_text,-x,-y,(uint32_t*)data,pitch / 4, width,height);
+
+		// Frame timing stats
+		sprintf(debug_text, "%.1f/%.1f A:%.1f M:%.1f D:%d", perf.fps, perf.req_fps, perf.avg_frame_ms, perf.max_frame_ms, perf.frame_drops);
+		blitBitmapText(debug_text,x,-y,(uint32_t*)data,pitch / 4, width,height);
+		
+		// CPU stats
+		PLAT_getCPUSpeed();
+		PLAT_getCPUTemp();
+		sprintf(debug_text, "%.0f%%/%ihz/%ic", perf.cpu_usage, perf.cpu_speed, perf.cpu_temp);
+		blitBitmapText(debug_text,x,-y - 14,(uint32_t*)data,pitch / 4, width,height);
+		
+		// GPU stats
+		PLAT_getGPUUsage();
+		PLAT_getGPUSpeed();
+		PLAT_getGPUTemp();
+		sprintf(debug_text, "%.0f%%/%ihz/%ic", perf.gpu_usage, perf.gpu_speed, perf.gpu_temp);
+		blitBitmapText(debug_text,x,-y - 28,(uint32_t*)data,pitch / 4, width,height);
+
+		if(currentshaderpass>0) {
+			sprintf(debug_text, "%i/%ix%i/%ix%i/%ix%i", currentshaderpass, currentshadersrcw,currentshadersrch,currentshadertexw,currentshadertexh,currentshaderdstw,currentshaderdsth);
+			blitBitmapText(debug_text,x,-y - 42,(uint32_t*)data,pitch / 4, width,height);
+		}
+	
+		double buffer_fill = (double) (perf.buffer_size - perf.buffer_free) / (double) perf.buffer_size;
+		drawGauge(x, y + 30, buffer_fill, width / 2, 8, (uint32_t*)data, pitch / 4);
+	}
+}
+
+// Exported entry for the hw-render path (ma_gl.c), which has no CPU frame
+// and rasterizes this same HUD onto a frontend surface. The software path
+// below calls drawDebugHud() on the core frame exactly like upstream.
+void PLAT_draw_debug_hud(const void* data, unsigned width, unsigned height, size_t pitch, enum retro_pixel_format fmt) {
+	drawDebugHud(data, width, height, pitch, fmt);
+}
+
 static void video_refresh_callback_main(const void *data, unsigned width, unsigned height, size_t pitch) {
 	// return;
 
@@ -100,6 +571,11 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 		}
 	}
 	
+	// minarch's original debug HUD (upstream call site): stamped into the core
+	// frame, so it travels the shader chain and scales with the game.
+	PLAT_draw_debug_hud(data, width, height, pitch, fmt);
+
+
 	renderer.src = (void*)data;
 	renderer.dst = screen->pixels;
 	GFX_blitRenderer(&renderer);

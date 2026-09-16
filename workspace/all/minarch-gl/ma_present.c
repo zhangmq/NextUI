@@ -18,6 +18,7 @@ void MA_present_init(SDL_Window *window) {
 	SDL_Log("minarch: present via SDL_GL_SwapWindow (window=%p)", (void *)ma_window);
 }
 
+
 void MA_present_frame(void) {
 	if (!ma_window) return;
 	// One-shot proof that present is reachable at all: the first regression

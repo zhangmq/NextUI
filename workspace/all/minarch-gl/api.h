@@ -4,6 +4,7 @@
 #include "platform.h"
 #include "scaler.h"
 #include "config.h"
+#include "libretro.h" // enum retro_pixel_format (PLAT_draw_debug_hud)
 #include <stdbool.h>
 
 ///////////////////////////////
@@ -346,10 +347,10 @@ SDL_Color /*GFX_*/ uintToColour(uint32_t rgba);
 void GFX_startFrame(void);
 void GFX_flip(SDL_Surface* screen);
 // The present paths (GFX_flip / GFX_GL_Swap) sample their per-frame statistics
-// -- and the audio-clock current_fps -- inside themselves. The GL hw-render
-// path has a separate HUD-only stats tick with its own state:
-// MA_GL_hud_stats_tick (ma_gl.h). Frame pacing is not here at all: it lives in
-// the run loop (pace_frame, minarch.c).
+// -- and the audio-clock current_fps -- inside themselves.  The GL hw-render
+// path calls GFX_frame_stats_display_only() (same window, current_fps left
+// alone).  Frame pacing is not here at all: it lives in the run loop
+// (pace_frame, minarch.c).
 // Present mode (hidden config key minarch_present / env MINARCH_PRESENT),
 // defined in generic_video.c (textually included from platform.c):
 //   MA_PRESENT_VSYNC: SDL_GL_SwapWindow.  The swap is the display's to time:
@@ -736,9 +737,12 @@ void PLAT_compute_present_mvp(int rotation, float mvp[16]);
 // Shared by the software path (PLAT_GL_Swap) and the hw-render path; the
 // caller adds the Screen X/Y offsets and clamps nothing (the viewport clips).
 void PLAT_diag_capture(const char *tag);
-// Debug HUD panel (top-left). Rasterised on the main thread by
-// MA_GL_hud_update, drawn by both present paths after the game frame.
-void PLAT_draw_debug_hud(void);
+// minarch's original debug HUD (bitmap font, four screen corners), restored
+// verbatim from upstream ma_video.c. The software path calls it on the core
+// frame (upstream call site); the hw-render path has no CPU frame, so ma_gl.c
+// rasterizes the same function onto a frontend surface and composites it.
+void GFX_frame_stats_display_only(double target_fps);
+void PLAT_draw_debug_hud(const void* data, unsigned width, unsigned height, size_t pitch, enum retro_pixel_format fmt);
 
 // P4: RetroArch .glslp preset -> minarch preset key/value text (glslp.c).
 // Defined in glslp.c; self-contained so it can be unit-tested on the host.

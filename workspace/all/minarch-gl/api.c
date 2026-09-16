@@ -771,16 +771,16 @@ void GFX_setAmbientColor(const void *data, unsigned width, unsigned height, size
 // audio -- dynamic rate control trims the drift between the present cadence
 // and the sound card that paces it.
 //
-// The GL hw-render path must not feed this sampler: its loop cadence is not
-// the audio clock, and writing current_fps from there made the audio pitch
-// follow the frontend loop rate. That path keeps its own HUD statistics in
-// ma_gl.c (MA_GL_hud_stats_tick), which fill only the perf display fields.
+// The GL hw-render path must not feed current_fps: its loop cadence is not the
+// audio clock, and writing it from there made the audio pitch follow the
+// frontend loop rate.  It calls GFX_frame_stats_display_only() instead, which
+// runs this same window with feed_current_fps == 0.
 //
 // target_fps: the pacing target (drops/jitter are measured against it; the
 // pre-100-frame warm-up reports it instead of an empty average).
 // clamp_to_target: GFX_GL_Swap clamps absurd frame times to the target so one
 // stalled frame does not drag the rolling average.
-static void frame_stats_sample(double target_fps, int clamp_to_target)
+static void frame_stats_sample(double target_fps, int clamp_to_target, int feed_current_fps)
 {
 	if (target_fps <= 0.0)
 		target_fps = SCREEN_FPS;
@@ -821,19 +821,31 @@ static void frame_stats_sample(double target_fps, int clamp_to_target)
 		}
 		average_fps /= fpsbuffersize;
 		avg_ft /= fpsbuffersize;
-		current_fps = average_fps;
-		perf.fps = current_fps;
+		// feed_current_fps == 0 is the hw-render debug HUD's display-only
+		// sample: current_fps is the audio resample denominator
+		// (SND_batchSamples) and must keep tracking the audio clock.
+		if (feed_current_fps) current_fps = average_fps;
+		perf.fps = feed_current_fps ? current_fps : average_fps;
 		perf.avg_frame_ms = avg_ft;
 		perf.max_frame_ms = max_ft;
 	}
 	else
 	{
-		current_fps = target_fps;
+		if (feed_current_fps) current_fps = target_fps;
 		perf.fps = target_fps;
 		perf.avg_frame_ms = 1000.0 / target_fps;
 		perf.max_frame_ms = perf.avg_frame_ms;
 	}
 	per_frame_start = SDL_GetPerformanceCounter();
+}
+
+// Display-only frame statistics for the hw-render path's debug HUD: the same
+// rolling window as the present samplers, but current_fps (the software
+// paths' audio resample denominator) is left untouched -- feeding it from the
+// hw loop made the audio pitch follow the frontend loop rate.
+void GFX_frame_stats_display_only(double target_fps)
+{
+	frame_stats_sample(target_fps, 0, 0);
 }
 
 void GFX_flip(SDL_Surface *screen)
@@ -847,7 +859,7 @@ void GFX_flip(SDL_Surface *screen)
 	}
 	PLAT_flip(screen, 0);
 
-	frame_stats_sample(SCREEN_FPS, 1);
+	frame_stats_sample(SCREEN_FPS, 1, 1);
 }
 void GFX_GL_Swap()
 {
@@ -860,7 +872,7 @@ void GFX_GL_Swap()
 	}
 	PLAT_GL_Swap();
 
-	frame_stats_sample(SCREEN_FPS, 1);
+	frame_stats_sample(SCREEN_FPS, 1, 1);
 }
 // eventually this function should be removed as its only here because of all the audio buffer based delay stuff
 void GFX_sync(void)
