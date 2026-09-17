@@ -262,6 +262,9 @@ enum {
 	SHORTCUT_HOLD_REWIND,
 	SHORTCUT_GAMESWITCHER,
 	SHORTCUT_SCREENSHOT,
+	// minarch-gl: switch the d-pad between its own buttons and the analog
+	// stick (for SKUs with no analog stick).  See ma_core.c.
+	SHORTCUT_TOGGLE_DPAD,
 	// Trimui only
 	SHORTCUT_TOGGLE_TURBO_A,
 	SHORTCUT_TOGGLE_TURBO_B,

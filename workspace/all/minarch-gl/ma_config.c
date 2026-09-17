@@ -1805,6 +1805,11 @@ struct Config config = {
 		[SHORTCUT_HOLD_REWIND]			= {"Hold Rewind",		-1, BTN_ID_NONE, 0},
 		[SHORTCUT_GAMESWITCHER]			= {"Game Switcher",		-1, BTN_ID_NONE, 0},
 		[SHORTCUT_SCREENSHOT]           = {"Screenshot",        -1, BTN_ID_NONE, 0},
+		// minarch-gl: unlike every other row this one is not upstream, so stock
+		// minarch neither knows the key nor keeps it when it rewrites a per-core
+		// cfg (it writes only its own table).  Unbound by default; the mode itself
+		// defaults from NEXTUI_ANALOG_DPAD (see ma_core.c) and is per session.
+		[SHORTCUT_TOGGLE_DPAD]          = {"Toggle D-Pad Mode", -1, BTN_ID_NONE, 0},
 		// Trimui only
 		[SHORTCUT_TOGGLE_TURBO_A]		= {"Toggle Turbo A",	-1, BTN_ID_NONE, 0},
 		[SHORTCUT_TOGGLE_TURBO_B]		= {"Toggle Turbo B",	-1, BTN_ID_NONE, 0},

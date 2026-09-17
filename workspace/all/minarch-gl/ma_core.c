@@ -30,6 +30,139 @@ void Core_getName(char* in_name, char* out_name) {
 //     retro_run (RA core_run:9116-9117 / 9157-9159) and this callback is a
 //     no-op, even though flycast calls poll_cb() anyway
 //     (shell/libretro/libretro.cpp:1078).
+
+// ---------------------------------------------------------------------------
+// MA_DPAD_POLICY (minarch-gl): d-pad <-> analog stick policy.
+//
+// EXPERIMENTAL -- test-only, and it may be REMOVED again.  It exists so the
+// stick-less H700 SKUs can reach a core's analog axes at all, is switched by an
+// environment variable plus an unbound Shortcuts hotkey, is not persisted and
+// has no UI of its own.  If the same policy lands in the platform layer (where
+// it would cover every app, including the launcher) this frontend-side copy
+// should go away rather than be maintained twice.
+//
+// The H700 SKUs with no analog stick (rgsp, rg34xx, rg35xxsp, rg28xx) cannot
+// reach a core's analog axes at all: input_state_callback() returns
+// pad.laxis/raxis, which the platform only writes for SKUs that have sticks.
+// This turns the physical d-pad into an analog source, switchable at runtime
+// with the "Toggle D-Pad Mode" Shortcuts hotkey and defaulted by the
+// environment:
+//
+//   NEXTUI_ANALOG_DPAD = off (default) | add-left | add-right | add-both
+//                      | route-left | route-right
+//
+//   add-*   the d-pad keeps its own buttons AND drives the stick.  Arcade
+//           driving games need this shape (Crazy Taxi shifts with d-pad
+//           UP/DOWN while the analog channel steers).
+//   route-* the d-pad drives the stick and its own JOYPAD bits are suppressed.
+//           That is the community N64 pak's "Input Mode: Joystick" and the
+//           right shape for games whose primary control is the d-pad.
+//
+// The hotkey toggles between the configured mode and off, so the configured
+// value is never lost.  Values are full deflection (+/-32767) with the same
+// sign convention the platform's SDL path uses for a real stick (up/left
+// negative), so cores' own deadzones and scaling apply unchanged.
+//
+// Scope: minarch-gl only, and per session -- nothing is persisted (the env var
+// is the only "config").  The same policy belongs in the platform layer if it
+// should cover every app; this is deliberately structured so that only
+// dpad_policy_analog()/dpad_policy_filter() would have to move.
+// ---------------------------------------------------------------------------
+enum {
+	DPAD_MODE_OFF = 0,
+	DPAD_MODE_ADD_LEFT,
+	DPAD_MODE_ADD_RIGHT,
+	DPAD_MODE_ADD_BOTH,
+	DPAD_MODE_ROUTE_LEFT,
+	DPAD_MODE_ROUTE_RIGHT,
+};
+
+static int dpad_mode = -1;      // -1 = not initialised yet
+static int dpad_mode_saved = 0; // mode the hotkey toggles back to
+
+static int dpad_policy_parse(const char *v) {
+	if (!v || !v[0] || !strcasecmp(v, "off"))     return DPAD_MODE_OFF;
+	if (!strcasecmp(v, "add-left"))               return DPAD_MODE_ADD_LEFT;
+	if (!strcasecmp(v, "add-right"))              return DPAD_MODE_ADD_RIGHT;
+	if (!strcasecmp(v, "add-both"))               return DPAD_MODE_ADD_BOTH;
+	if (!strcasecmp(v, "route-left"))             return DPAD_MODE_ROUTE_LEFT;
+	if (!strcasecmp(v, "route-right"))            return DPAD_MODE_ROUTE_RIGHT;
+	LOG_error("NEXTUI_ANALOG_DPAD: unknown value '%s' (off|add-left|add-right|add-both|route-left|route-right)\n", v);
+	return DPAD_MODE_OFF;
+}
+
+static int dpad_policy_mode(void) {
+	if (dpad_mode < 0) {
+		dpad_mode = dpad_policy_parse(getenv("NEXTUI_ANALOG_DPAD"));
+		if (dpad_mode != DPAD_MODE_OFF) {
+			LOG_info("d-pad policy: %s (NEXTUI_ANALOG_DPAD)\n", getenv("NEXTUI_ANALOG_DPAD"));
+		}
+	}
+	return dpad_mode;
+}
+
+static int dpad_policy_additive(int mode) {
+	return mode == DPAD_MODE_ADD_LEFT || mode == DPAD_MODE_ADD_RIGHT || mode == DPAD_MODE_ADD_BOTH;
+}
+
+static int dpad_policy_left(int mode) {
+	return mode == DPAD_MODE_ADD_LEFT || mode == DPAD_MODE_ADD_BOTH || mode == DPAD_MODE_ROUTE_LEFT;
+}
+
+static int dpad_policy_right(int mode) {
+	return mode == DPAD_MODE_ADD_RIGHT || mode == DPAD_MODE_ADD_BOTH || mode == DPAD_MODE_ROUTE_RIGHT;
+}
+
+static void dpad_policy_toggle(void) {
+	int mode = dpad_policy_mode();
+	if (mode == DPAD_MODE_OFF) {
+		// first use: the routing shape, i.e. "d-pad as the stick"
+		dpad_mode = dpad_mode_saved ? dpad_mode_saved : DPAD_MODE_ROUTE_LEFT;
+	} else {
+		dpad_mode_saved = mode;
+		dpad_mode = DPAD_MODE_OFF;
+	}
+	LOG_info("d-pad policy: %s\n", dpad_mode == DPAD_MODE_OFF ? "off" :
+		dpad_mode == DPAD_MODE_ADD_LEFT ? "add-left" :
+		dpad_mode == DPAD_MODE_ADD_RIGHT ? "add-right" :
+		dpad_mode == DPAD_MODE_ADD_BOTH ? "add-both" :
+		dpad_mode == DPAD_MODE_ROUTE_LEFT ? "route-left" : "route-right");
+}
+
+// Runs right after the upstream poll callback (which owns the Shortcuts table
+// and the menu-open-on-MENU-release rule), so a MENU+button binding can still
+// cancel the menu it would otherwise open.
+static void dpad_policy_hotkey(void) {
+	ButtonMapping *m = &config.shortcuts[SHORTCUT_TOGGLE_DPAD];
+	if (!m->name || m->local < 0) return;                 // unbound
+	if (m->mod && !PAD_isPressed(BTN_MENU)) return;
+	if (!PAD_justPressed(1 << m->local)) return;
+	dpad_policy_toggle();
+	if (m->mod) show_menu = 0;
+}
+
+// The analog value the d-pad contributes (0 when this mode does not drive it).
+static int16_t dpad_policy_analog(int mode, unsigned index, unsigned id) {
+	int left = dpad_policy_left(mode), right = dpad_policy_right(mode);
+	if (index == RETRO_DEVICE_INDEX_ANALOG_LEFT && !left) return 0;
+	if (index == RETRO_DEVICE_INDEX_ANALOG_RIGHT && !right) return 0;
+	if (index != RETRO_DEVICE_INDEX_ANALOG_LEFT && index != RETRO_DEVICE_INDEX_ANALOG_RIGHT) return 0;
+
+	if (id == RETRO_DEVICE_ID_ANALOG_X) {
+		if (PAD_isPressed(BTN_DPAD_LEFT)) return -32767;
+		if (PAD_isPressed(BTN_DPAD_RIGHT)) return 32767;
+	} else if (id == RETRO_DEVICE_ID_ANALOG_Y) {
+		if (PAD_isPressed(BTN_DPAD_UP)) return -32767;
+		if (PAD_isPressed(BTN_DPAD_DOWN)) return 32767;
+	}
+	return 0;
+}
+
+#define DPAD_JOYPAD_DIRS ((1 << RETRO_DEVICE_ID_JOYPAD_UP) | (1 << RETRO_DEVICE_ID_JOYPAD_DOWN) | \
+                          (1 << RETRO_DEVICE_ID_JOYPAD_LEFT) | (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT))
+
+static int dpad_policy_debug = -1;
+
 void core_input_poll_callback(void) {
 	// RA core_input_state_poll_maybe (runloop.c:5069-5078): the callback the
 	// core calls polls only under NORMAL.  DONTCARE(0) is RA's default for a
@@ -37,6 +170,7 @@ void core_input_poll_callback(void) {
 	// frontend instead (the main loop / core_input_state_callback below).
 	if (input_poll_type_override == 0 || input_poll_type_override == 2)
 		input_poll_callback();
+	dpad_policy_hotkey();
 }
 
 // LATE: RA polls on the core's first retro_input_state read of the frame
@@ -48,7 +182,42 @@ static int16_t core_input_state_callback(unsigned port, unsigned device,
 	if (input_poll_type_override == 3 && !input_state_polled_this_frame) {
 		input_state_polled_this_frame = 1;
 		input_poll_callback();
+		dpad_policy_hotkey();
 	}
+
+	int mode = dpad_policy_mode();
+	if (mode == DPAD_MODE_OFF || port != 0 || index != 0)
+		return input_state_callback(port, device, index, id);
+
+	if (dpad_policy_debug < 0)
+		dpad_policy_debug = getenv("NEXTUI_ANALOG_DPAD_DEBUG") != NULL;
+
+	if (device == RETRO_DEVICE_JOYPAD) {
+		int16_t v = input_state_callback(port, device, index, id);
+		if (dpad_policy_additive(mode) == 0) {
+			if (id == RETRO_DEVICE_ID_JOYPAD_MASK) {
+				if (dpad_policy_debug && (v & DPAD_JOYPAD_DIRS))
+					LOG_info("DPADPOLICY joypad d-pad bits %#x suppressed (MASK)\n", v & DPAD_JOYPAD_DIRS);
+				v = (int16_t)(v & ~DPAD_JOYPAD_DIRS);
+			}
+			else if (id <= RETRO_DEVICE_ID_JOYPAD_R3 && (DPAD_JOYPAD_DIRS & (1 << id))) {
+				if (dpad_policy_debug && v) LOG_info("DPADPOLICY joypad dir id=%u suppressed\n", id);
+				v = 0;
+			}
+		}
+		return v;
+	}
+
+	if (device == RETRO_DEVICE_ANALOG) {
+		int16_t v = input_state_callback(port, device, index, id);
+		if (v == 0) {
+			v = dpad_policy_analog(mode, index, id);
+			if (v && dpad_policy_debug)
+				LOG_info("DPADPOLICY axis idx=%u id=%u -> %i\n", index, id, v);
+		}
+		return v;
+	}
+
 	return input_state_callback(port, device, index, id);
 }
 
