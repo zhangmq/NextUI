@@ -67,7 +67,8 @@ void MA_GL_set_rotation(unsigned rotation);
 void MA_GL_make_current(void);
 
 // RA semantics (SET_SYSTEM_AV_INFO): the hw-render FBO size follows the
-// core's reported geometry max dimensions (tex_w = next_pow2(max_dim)).
+// core's reported geometry max dimensions (texture = RARCH_SCALE_BASE *
+// max(next_pow2(max_dim) / RARCH_SCALE_BASE, 1), RA's hw-render FBO rule).
 // Call when av_info.geometry.max_width/max_height change; rebuilds the
 // frontend FBOs and re-runs the core's context_reset if the size grew.
 void MA_GL_update_fbo_size(void);

@@ -421,9 +421,6 @@ static void Config_readOptionsString(char* cfg) {
 		Config_syncFrontend(option->key, option->value);
 	}
 	
-	// Hidden present mode (no UI entry): vsync | async.  Deliberately not in
-	// the options table -- it selects a presentation policy, not a user
-	// preference, and the table drives the menu.  See ma_internal.h.
 	if (has_custom_controllers && Config_getValue(cfg,"minarch_gamepad_type",value,NULL)) {
 		gamepad_type = strtol(value, NULL, 0);
 		int device = strtol(gamepad_values[gamepad_type], NULL, 0);

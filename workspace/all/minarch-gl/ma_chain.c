@@ -479,8 +479,9 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 // Run the configured shader chain (0..MAXSHADERS passes) followed by the
 // finalscale pass into dst_rect. Shared by BOTH present paths: the software
 // path passes its uploaded frame texture (also used as the OrigTexture
-// uniform source), the hw-render path passes its pow2 hw-render FBO texture
-// directly (RA gl2 semantics -- no separate normalize step). Consumes
+// uniform source); the hw-render path first normalizes its pow2 FBO content
+// into an exact-size texture (ma_gl_normalize_source) and passes that, because
+// the NextUI contract requires texture == content. Consumes
 // reloadShaderTextures (chain metadata and texture params are rebuilt when
 // set). No software-only state (vid.blit) is referenced: frame dimensions
 // arrive as parameters.
@@ -590,10 +591,10 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 	GLuint final_src = (nrofshaders > 0) ? shaders[nrofshaders - 1].target_texture : src_texture;
 	// Final scale-to-screen pass: RA gl2_renderchain_render's last block
 	// (gl2.c:1617-1683). InputSize/TextureSize = the last FBO's content /
-	// pow2 size; OutputSize = the present viewport; MVP = the rotated
-	// projection (gl2_set_projection allow_rotate). SET_ROTATION is
-	// applied here, not to the chain, exactly like RA: the chain runs in
-	// the core's orientation and only the final quad rotates.
+	// pow2 size; OutputSize = the present viewport.  SET_ROTATION is already
+	// baked into the source UVs -- on the hw path by ma_gl_normalize_source,
+	// on the software path by the upload convention -- so both callers pass
+	// rotation 0 with the NextUI geometry (identity MVP).
 	// final_noflip selects the straight-sampler pass (stock noshader.glsl,
 	// no v flip) for sources that are already top-down (hw-render FBs); the
 	// software path uses stock default.glsl, which flips v -- and that flip

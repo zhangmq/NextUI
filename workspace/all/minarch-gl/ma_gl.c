@@ -754,14 +754,13 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	float ortho[16];
 	PLAT_compute_present_mvp(ma_gl_rotation, ortho);
 
-	// Draw the quad with a clean pipeline. GL_FRAMEBUFFER (READ + DRAW)
-	// binds to 0 here, which also pins the menu-capture contract: the
-	// in-game menu's GFX_GL_screenCapture (glReadPixels) reads the READ
-	// binding and must see the PRESENTED frame, not the 1024x1024 render
-	// FBO (that would give the 640x480 content anchored bottom-left, game
-	// shifted left with an empty band). This does not touch bindings;
-	// glsm's next STATE_BIND restores the core's FBO
-	// (default_framebuffer == ma_gl_fbo) at the start of retro_run.
+	// Draw into the present target: the default framebuffer live, or the
+	// offscreen capture target while PLAT_GL_screenCapture replays the present
+	// (runShaderPass binds the same target for its final pass).  Captures read
+	// that replay -- never the window, because glReadPixels on the default
+	// framebuffer returns zeros on this driver.  This does not touch the core's
+	// FBO; glsm's next STATE_BIND restores it (default_framebuffer == ma_gl_fbo)
+	// at the start of retro_run.
 	// Default framebuffer, or the offscreen capture target during a replay.
 	glBindFramebuffer(GL_FRAMEBUFFER, PLAT_chain_present_target());
 	// RA gl2_set_viewport: viewport = the aspect-fit pixel rect (unit quad +
@@ -818,10 +817,10 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 		if (ma_gl_present_tex_loc >= 0)
 			glUniform1i(ma_gl_present_tex_loc, 1);
 		glActiveTexture(GL_TEXTURE1);
-		// Dual-buffer present (RA gl2 semantics): sample the COMPLETED slot,
-		// never the one the core rendered into this frame. RA set_params
-		// binds the orig texture on unit 1 (texunit starts at 1) and sets
-		// the sampler uniform to it.
+		// RA set_params binds the orig texture on unit 1 (texunit starts at 1)
+		// and points the sampler uniform at it.  This frontend owns ONE
+		// hw-render FBO (MA_GL_FBO_COUNT 1, no per-frame slot rotation), so
+		// "orig" is simply that FBO's texture: there is no second slot.
 		glBindTexture(GL_TEXTURE_2D, ma_gl_sample_tex());
 		// Screen Sharpness: re-asserted every present (2 param calls,
 		// trivial) so the sampler state stays authoritative regardless of
@@ -1084,7 +1083,9 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		uint64_t us = (SDL_GetPerformanceCounter() - mg_t0) * 1000000ull / (mg_freq ? mg_freq : 1);
 		mg_draw_us_sum += us;
 		if (us > mg_draw_us_max) mg_draw_us_max = us;
-		if (data == VALID) mg_new_frames++; else mg_dupe_frames++;
+		// Only VALID frames reach this point: NULL returned above (dupe
+		// branch) and every other pointer returned at the top.
+		mg_new_frames++;
 	}
 
 	// Present here, in the video frame callback -- RetroArch's shape

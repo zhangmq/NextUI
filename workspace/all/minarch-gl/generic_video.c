@@ -37,10 +37,6 @@
 // RA FinalViewportSize (shader_glsl.c set_params, params.vp_width/height):
 // the final output viewport of this frame's present, uploaded to every pass
 // of the chain. Set by PLAT_run_shader_pipeline from the present rect.
-// Set when the GL window accepts swap-interval vsync (see PLAT_initVideo);
-// drives whether the hw-render present path throttles by usleep or by swap.
-int ma_gl_vsync_active = 0;
-
 #include "ma_present.h"   // one present for the whole frontend
 
 
@@ -55,7 +51,6 @@ static struct VID_Context {
 	int width;
 	int height;
 	int pitch;
-	int sharpness;
 	uint32_t clear_color;
 } vid;
 
@@ -632,14 +627,13 @@ SDL_Surface* PLAT_initVideo(void) {
 	glViewport(0, 0, w, h);
 
 	// Probe real swap-interval vsync (RA enable_vsync semantics) instead of
-	// assuming the driver cannot vsync. The result is only logged here: the
-	// hw-render present path still uses the usleep throttle until swap-vsync
-	// pacing (incl. fast-forward interplay) is wired up.
+	// assuming the driver cannot vsync, then keep the interval at 0: pacing is
+	// owned by ma_pace.c (audio back-pressure, then a blocking swap, then the
+	// timer), so nothing branches on this probe's result.
 	{
 		int swap_ok = (SDL_GL_SetSwapInterval(1) == 0);
 		if (swap_ok)
 			SDL_GL_SetSwapInterval(0);
-		ma_gl_vsync_active = 0;
 		LOG_info("minarch: GL swap-interval vsync %s\n",
 			swap_ok ? "supported" : "unsupported by driver");
 	}
@@ -658,7 +652,6 @@ SDL_Surface* PLAT_initVideo(void) {
 	device_height	= h;
 	device_pitch	= p;
 
-	vid.sharpness = SHARPNESS_SOFT;
 
 	return vid.screen;
 }
@@ -914,19 +907,8 @@ void PLAT_setVsync(int vsync) {
 	//}
 }
 
-static int hard_scale = 4; // TODO: base src size, eg. 160x144 can be 4
-
-
 static void resizeVideo(int w, int h, int p) {
 	if (w==vid.width && h==vid.height && p==vid.pitch) return;
-
-	// TODO: minarch disables crisp (and nn upscale before linear downscale) when native, is this true?
-
-	if (w>=device_width && h>=device_height) hard_scale = 1;
-	// else if (h>=160) hard_scale = 2; // limits gba and up to 2x (seems sufficient for 640x480)
-	else hard_scale = 4;
-
-	// LOG_info("resizeVideo(%i,%i,%i) hard_scale: %i crisp: %i\n",w,h,p, hard_scale,vid.sharpness==SHARPNESS_CRISP);
 
 	// Only the frame description changes now: the present paths read their
 	// source dimensions from the caller, and there is no SDL texture to resize.

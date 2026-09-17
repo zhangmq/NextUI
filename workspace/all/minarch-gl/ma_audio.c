@@ -3,7 +3,6 @@
 #include <msettings.h>
 #include "ma_internal.h"
 #include "ma_audio.h"
-#include "ma_gl.h"
 
 static bool resetAudio = false;
 
