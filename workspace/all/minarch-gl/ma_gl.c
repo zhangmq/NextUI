@@ -711,14 +711,18 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	PLAT_compute_present_rect((int)disp_w, (int)disp_h,
 			&dst_x, &dst_y, &dst_w, &dst_h);
 	// Screen X/Y offsets (frontend-specific, no RA equivalent): applied to
-	// the SCREEN-space rect. NOTE the y sign: dst_y goes through the NDC
-	// conversion below (cy = 1 - 2y/H, which treats dst_y as screen-y-down
-	// and flips it), so the offset must be SUBTRACTED here for +screeny to
-	// move the picture up on screen -- matching the software path's +y-up
-	// behavior for every orientation. The offsets must NOT be applied in
-	// the pre-rotation (content) space: that swaps x/y on rotated games.
+	// the SCREEN-space rect.  Both present paths feed this rect straight into
+	// a GL viewport (glViewport here, runShaderPass -> glViewport on the
+	// software path), i.e. y-up, so the SAME sign gives the same direction on
+	// screen -- and that direction is the software path's, which is the
+	// reference behaviour by decision (2026-09-17): +screeny moves the picture
+	// UP.  (Stock minarch put the rect through SDL_RenderCopy, whose y grows
+	// downwards, so its +screeny moved the picture down: a deliberate
+	// divergence from stock, recorded here because the two are easy to
+	// confuse.  The offsets must NOT be applied in the pre-rotation (content)
+	// space: that swaps x/y on rotated games.)
 	dst_x += screenx;
-	dst_y -= screeny;
+	dst_y += screeny;
 
 	// RA gl2 final pass geometry (gl2.c vertexes/vertexes_flipped +
 	// gl2_set_projection): unit quad in 0..1, MVP = ortho(0..1,0..1)

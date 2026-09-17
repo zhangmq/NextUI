@@ -1840,10 +1840,22 @@ void PLAT_GL_Swap() {
 	// Software cores: NextUI conventions -- exact-size pass textures, the
 	// Source/Texture Type numbers, clip-space quads + identity MVP and the
 	// stock system shaders (see AGENTS.md「呈现/shader 链架构」).
+	//
+	// Present over a CLEAN frame.  The game draw covers only the present rect
+	// (Screen Scaling plus the Screen X/Y offsets), so whatever this back
+	// buffer held outside that rect would stay on screen: with SDL's two back
+	// buffers holding different leftovers, the uncovered band flickers between
+	// them and can show the last menu frame.  The hw path has always cleared
+	// its target every frame (ma_gl.c, ma_gl_present_quad); do the same here,
+	// to the same opaque black, so the two paths look identical.  The 3-frame
+	// clear above stays: it also clears depth after a shader reload.
+	glBindFramebuffer(GL_FRAMEBUFFER, PLAT_chain_present_target());
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
 	sw_present_draw();
-	// The debug HUD is minarch's original one and is stamped into the core
-	// frame in ma_video.c (upstream call site), so it is already part of the
-	// texture this function just presented -- nothing to composite here.
+	// The debug HUD is composited by PLAT_composite_overlays inside
+	// sw_present_draw (one layer of the shared overlay stage), so there is
+	// nothing to do for it here.
 
 	MA_present_frame();
 
