@@ -160,6 +160,9 @@ static const float gl_chain_mvp[16] = {
 // frame_count_mod (glslp.c ignores that key by design), so the raw counter is
 // passed.  -1 = leave the uniform alone, which is what the frontend's own
 // overlay/HUD/UI draws get (RA's stock-blend equivalents).
+// The note is a one-shot handed to the next draw and consumed at the top of
+// runShaderPass, before any early return, so it can never survive to a draw
+// it was not meant for.
 static int s_draw_frame_count = -1;
 
 void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
@@ -181,6 +184,12 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	static GLint max_tex_size = 0;
 	static int logged_bad_size = 0;
 	GLenum pre_err;
+
+	// One-shot note: consume it here, before any early return below, so a
+	// draw that bails out (NULL pass / invalid target) cannot leave the note
+	// set for the next draw.
+	const int draw_frame_count = s_draw_frame_count;
+	s_draw_frame_count = -1;
 
 	if (!shader_pass) return;
 
@@ -330,9 +339,8 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	// calls set_params per pass): the size uniforms change between passes,
 	// so a program re-used across passes must still get fresh values.
 	if (shader_program->u_FrameDirection >= 0) glUniform1i(shader_program->u_FrameDirection, 1);
-	if (shader_program->u_FrameCount >= 0 && s_draw_frame_count >= 0)
-		glUniform1i(shader_program->u_FrameCount, s_draw_frame_count);
-	s_draw_frame_count = -1; // one-shot, like RA's per-pass parameters
+	if (shader_program->u_FrameCount >= 0 && draw_frame_count >= 0)
+		glUniform1i(shader_program->u_FrameCount, draw_frame_count);
 	if (shader_program->u_OutputSize >= 0) glUniform2f(shader_program->u_OutputSize, dst_width, dst_height);
 	if (shader_program->u_TextureSize >= 0) glUniform2f(shader_program->u_TextureSize, shader_pass->texw, shader_pass->texh);
 	if (shader_program->u_InputSize >= 0) glUniform2f(shader_program->u_InputSize, shader_pass->srcw, shader_pass->srch);
