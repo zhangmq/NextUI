@@ -635,7 +635,7 @@ static uint32_t frame_start = 0;
 static uint64_t per_frame_start = 0;
 #define FPS_BUFFER_SIZE 50
 // filling with  60.1 cause i'd rather underrun than overflow in start phase
-static double fps_buffer[FPS_BUFFER_SIZE] = {60.1};
+static double fps_time_buffer[FPS_BUFFER_SIZE] = {0}; // frame ms, clamped for the rate
 static double frame_time_buffer[FPS_BUFFER_SIZE] = {0};
 static int fps_buffer_index = 0;
 
@@ -771,6 +771,18 @@ void GFX_setAmbientColor(const void *data, unsigned width, unsigned height, size
 // audio -- dynamic rate control trims the drift between the present cadence
 // and the sound card that paces it.
 //
+// The sample point is right after the video callback, i.e. BEFORE the pace
+// sleep (ma_pace.c), so an interval carries the per-iteration work jitter of
+// the core wait/draw/swap on top of the frame period.  Both count-based
+// fields therefore work over the whole window instead of per interval:
+// perf.fps = frames/elapsed (RetroArch's definition) and perf.frame_drops =
+// frame slots the window came up short against target_fps.  Averaging the
+// per-frame RATES (mean 1/dt) and flagging every interval over 1.1*target as
+// a drop both read that jitter as real: a perfectly paced 50.00 fps N64 run
+// measured intervals alternating around 20 ms, which the old code reported as
+// 57-61 fps with 125 "drops" per 5 s window (70-88 fps with the core's
+// threaded renderer).  avg_frame_ms/max_frame_ms keep the raw values.
+//
 // The GL hw-render path must not feed current_fps: its loop cadence is not the
 // audio clock, and writing it from there made the audio pitch follow the
 // frontend loop rate.  It calls GFX_frame_stats_display_only() instead, which
@@ -787,40 +799,52 @@ static void frame_stats_sample(double target_fps, int clamp_to_target, int feed_
 
 	uint64_t performance_frequency = SDL_GetPerformanceFrequency();
 	double elapsed_time_s = (double)(SDL_GetPerformanceCounter() - per_frame_start) / performance_frequency;
-	double tempfps = 1.0 / elapsed_time_s;
+	double frame_ms = elapsed_time_s * 1000.0;
 
 	// Stats logic
-	double frame_ms = elapsed_time_s * 1000.0;
 	double target_ms = 1000.0 / target_fps;
 	perf.jitter = fabs(frame_ms - target_ms);
 
-	if (frame_ms > target_ms * 1.1) {
-		perf.frame_drops++;
+	// Same clamp the old code applied to tempfps ([0.8, 1.2] * target, so one
+	// stalled frame cannot drag the audio denominator) -- now expressed in
+	// frame time so the window sum below is elapsed time.
+	double fps_frame_ms = frame_ms;
+	if (clamp_to_target) {
+		double min_ms = target_ms / 1.2;
+		double max_ms = target_ms / 0.8;
+		if (fps_frame_ms < min_ms) fps_frame_ms = min_ms;
+		if (fps_frame_ms > max_ms) fps_frame_ms = max_ms;
 	}
 
-	if (clamp_to_target &&
-			(tempfps < target_fps * 0.8 || tempfps > target_fps * 1.2))
-		tempfps = target_fps;
-
-	fps_buffer[fps_buffer_index] = tempfps;
 	frame_time_buffer[fps_buffer_index] = frame_ms;
+	fps_time_buffer[fps_buffer_index] = fps_frame_ms;
 	fps_buffer_index = (fps_buffer_index + 1) % FPS_BUFFER_SIZE;
 	// give it a little bit to stabilize and then use, meanwhile the buffer will
 	// cover it
 	if (fps_counter++ > 100)
 	{
-		double average_fps = 0.0;
 		double avg_ft = 0.0;
 		double max_ft = 0.0;
+		double sum_fps_ms = 0.0;
 		int fpsbuffersize = MIN(fps_counter, FPS_BUFFER_SIZE);
 		for (int i = 0; i < fpsbuffersize; i++)
 		{
-			average_fps += fps_buffer[i];
+			sum_fps_ms += fps_time_buffer[i];
 			avg_ft += frame_time_buffer[i];
 			if (frame_time_buffer[i] > max_ft) max_ft = frame_time_buffer[i];
 		}
-		average_fps /= fpsbuffersize;
 		avg_ft /= fpsbuffersize;
+
+		// Frames per second as frames/elapsed over the window (RetroArch's
+		// definition), never mean(1/dt).
+		double average_fps = (sum_fps_ms > 0.0) ? ((double)fpsbuffersize * 1000.0 / sum_fps_ms) : 0.0;
+
+		// Frame slots the window came up short by, against target_fps.  Under
+		// a locked timeline the window covers exactly fpsbuffersize frame
+		// periods, so this is 0; a real hitch leaves the window short.
+		double frames_expected = (avg_ft * (double)fpsbuffersize) * target_fps / 1000.0;
+		int frames_lost = (int)(frames_expected - (double)fpsbuffersize + 0.5);
+		perf.frame_drops = (frames_lost > 0) ? frames_lost : 0;
 		// feed_current_fps == 0 is the hw-render debug HUD's display-only
 		// sample: current_fps is the audio resample denominator
 		// (SND_batchSamples) and must keep tracking the audio clock.
