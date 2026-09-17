@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <SDL2/SDL.h>
 
 #include "ma_internal.h"
@@ -83,6 +84,25 @@ void MA_pace_frame(void) {
 // fit)? We cannot answer that from inside the loop with one number, and the HUD
 // itself perturbs the measurement, so this logs a bucket histogram instead and
 // costs nothing when disabled.
+// Monotonic timestamp the optimizer may not fold.
+//
+// SDL_GetPerformanceCounter() is an ordinary function whose body LTO can see,
+// so with -O3/-flto the back end proved two consecutive reads in the run loop
+// identical and CSE'd them: the delta came out 0.0 on EVERY frame, the
+// histogram's "ms <= 0" guard rejected every sample, and the 5s window was
+// never printed. That is the long-standing "N64 (mupen hw path) telemetry
+// never emits, and adding a LOG_info in the gate makes it reappear" TODO --
+// it was never about the hw path, it is this measurement read being folded.
+// noinline + a memory clobber keeps the read opaque; the cost is one call per
+// loop iteration, only while the telemetry flag is set.
+static __attribute__((noinline)) uint64_t ma_tick_now(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	__asm__ __volatile__("" ::: "memory");
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#define MA_TICK_FREQ 1000000000.0
+
 void MA_telemetry_tick(void) {
 	// env var for a shell that has one, or just drop the marker file (no
 	// device script has to be edited to start a measurement run)
@@ -93,6 +113,7 @@ void MA_telemetry_tick(void) {
 	}
 	if (!enabled) return;
 
+
 	enum { NB = 7 };
 	static uint32_t buckets[NB];
 	static uint32_t frames = 0;
@@ -101,10 +122,9 @@ void MA_telemetry_tick(void) {
 	static uint64_t last_counter = 0;
 	static uint32_t last_log_ms = 0;
 
-	uint64_t now = SDL_GetPerformanceCounter();
+	uint64_t now = ma_tick_now();
 	if (!last_counter) { last_counter = now; last_log_ms = SDL_GetTicks(); return; }
-	double ms = (double)(now - last_counter) * 1000.0
-			/ (double)SDL_GetPerformanceFrequency();
+	double ms = (double)(now - last_counter) * 1000.0 / MA_TICK_FREQ;
 	last_counter = now;
 	if (ms <= 0.0 || ms > 1000.0) return; // 1s+ means we were not measuring
 

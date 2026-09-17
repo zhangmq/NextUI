@@ -8,9 +8,10 @@
 
 
 // The legacy scaler-era aspect field (0 = integer scale, -1 = stretch, >0 =
-// keep-aspect). Only the SDL message path (PLAT_flip -> setRectToAspectRatio)
-// still reads it; the present geometry itself comes from
-// PLAT_compute_present_rect. Single source for both refresh points below.
+// keep-aspect). Nothing reads renderer.aspect any more -- the present geometry
+// comes from PLAT_compute_present_rect -- but the field is still written so the
+// frame description stays a faithful copy of what upstream keeps there.
+// Single source for both refresh points below.
 static double renderer_aspect_for_scaling(int src_w, int src_h) {
 	switch (screen_scaling) {
 	case SCALE_ASPECT_SCREEN: return (double)src_w / (src_h ? src_h : 1);
@@ -512,11 +513,19 @@ static void drawDebugHud(const void* data, unsigned width, unsigned height, size
 	}
 }
 
-// Exported entry for the hw-render path (ma_gl.c), which has no CPU frame
-// and rasterizes this same HUD onto a frontend surface. The software path
-// below calls drawDebugHud() on the core frame exactly like upstream.
+// Exported entry for the shared overlay stage (generic_video.c
+// PLAT_composite_overlays), which rasterizes this same HUD onto a frontend
+// surface for BOTH present paths -- the software path no longer stamps it into
+// the core frame, so there is exactly one HUD implementation and one
+// composition point.  drawDebugHud still owns the "show_debug + 5s warm-up"
+// gate; PLAT_debug_hud_active lets the composite stage skip the upload and the
+// quad entirely while the HUD is off.
 void PLAT_draw_debug_hud(const void* data, unsigned width, unsigned height, size_t pitch, enum retro_pixel_format fmt) {
 	drawDebugHud(data, width, height, pitch, fmt);
+}
+
+int PLAT_debug_hud_active(void) {
+	return show_debug && SDL_GetTicks() > 5000;
 }
 
 static void video_refresh_callback_main(const void *data, unsigned width, unsigned height, size_t pitch) {
@@ -571,10 +580,13 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 		}
 	}
 	
-	// minarch's original debug HUD (upstream call site): stamped into the core
-	// frame, so it travels the shader chain and scales with the game.
-	PLAT_draw_debug_hud(data, width, height, pitch, fmt);
-
+	// The debug HUD is NOT stamped into the core frame here any more: it is
+	// composited by the ONE shared overlay stage (generic_video.c
+	// PLAT_composite_overlays), which runs after the frame from EITHER path is
+	// complete. That is what keeps the software and hw-render HUDs identical;
+	// stamping it here made the software HUD travel the shader chain while the
+	// hw-render HUD was drawn at device resolution after the present.
+	// PLAT_draw_debug_hud (below) is the single rasterizer both use.
 
 	renderer.src = (void*)data;
 	renderer.dst = screen->pixels;

@@ -13,6 +13,7 @@
 #include "ma_internal.h"
 #include "ma_present.h"
 #include "ma_gl.h"
+#include "ma_chain.h" // runShaderPass / s_pass_overlay (the shared overlay stage)
 
 // Screen X/Y raw offsets (Frontend menu): defined in generic_video.c as
 // screenx = x - 64 / screeny = y - 64 (range -64..64 px). No header
@@ -49,6 +50,37 @@ static unsigned mg_new_frames = 0, mg_dupe_frames = 0;
 // core frame maps onto it with xamt/yamt = frame/tex (can be < 1).
 #define RARCH_SCALE_BASE 256u
 
+// ---------------------------------------------------------------------------
+// FBO count: RA's hw-render contract is ONE FBO that the core renders into
+// and that the present path samples directly.
+//
+//   gl3 (GL 3.x, RA's current driver): gl3_init_hw_render() creates a single
+//   hw_render_fbo + hw_render_texture pair (gl3.c:2068-2081),
+//   gl3_get_current_framebuffer() returns that FBO verbatim (gl3.c:5610-5616,
+//   no index arithmetic) and the frame samples hw_render_texture
+//   (gl3.c:2782).
+//   gl2 (GL 2.x): hw render forces gl->textures = 1 (gl2.c:5368-5372, "All on
+//   GPU, no need to excessively create textures"), so its
+//   hw_render_fbo[(tex_index + 1) % textures] lookup (gl2.c:3214) and its
+//   per-frame gl->tex_index = (tex_index + 1) % textures flip (gl2.c:4163)
+//   both collapse to index 0. The sampled gl->texture[0] IS the colour
+//   attachment of hw_render_fbo[0] (attached in gl2_renderchain_init_hw_render,
+//   gl2.c:2245-2247) -- render target and sampled texture are the same object.
+//
+// So there is no second buffer and no per-frame index rotation here either.
+// An earlier dual-buffered variant (get_current_framebuffer returning
+// fbo[(write + 1) % 2] while the present flipped `write` every frame) made the
+// core render into the slot glsm had cached at SETUP while the present
+// alternated between that slot and the never-written one: the picture came up
+// every other frame (observed on N64 as "picture visible but flickering").
+// ---------------------------------------------------------------------------
+#define MA_GL_FBO_COUNT 1
+static GLuint ma_gl_fbo[MA_GL_FBO_COUNT] = { 0 };
+static GLuint ma_gl_fbo_tex[MA_GL_FBO_COUNT] = { 0 };
+static GLuint ma_gl_fbo_rb[MA_GL_FBO_COUNT] = { 0 };
+static bool ma_gl_fbo_valid = false;
+static unsigned ma_gl_fbo_dim_cur = 0; // actual created size (RA tex_w)
+
 // Next power of 2 (RA libretro-common retro_math.h next_pow2).
 static unsigned ma_gl_next_pow2(unsigned v) {
 	v--;
@@ -61,10 +93,12 @@ static unsigned ma_gl_next_pow2(unsigned v) {
 	return v;
 }
 
-// RA hw-render FBO size (video_driver.c:4602-4604 + gl2.c:5415):
+// RA hw-render FBO size (video_driver.c:4602-4604 + gl2.c:5415 + gl3.c:3239):
 // tex_w = tex_h = RARCH_SCALE_BASE * MAX(next_pow2(max_dim)/BASE, 1).
-// max_dim = MAX(max_width, max_height) of the core's reported geometry;
-// the frontend resizes its FBOs when that changes (runloop.c SET_SYSTEM_AV_INFO).
+// max_dim = MAX(max_width, max_height) of the core's reported geometry.
+// RA builds the FBO from this once per video-driver init, immediately before
+// hwr->context_reset() (drivers_init -> video_driver_init_internal, then
+// retroarch.c:1647-1648), which is what MA_GL_set_hw_render() below does.
 static unsigned ma_gl_fbo_dim(void) {
 	unsigned max_dim = core.max_width > core.max_height
 		? core.max_width : core.max_height;
@@ -72,21 +106,6 @@ static unsigned ma_gl_fbo_dim(void) {
 	if (scale < 1) scale = 1;
 	return RARCH_SCALE_BASE * scale;
 }
-// Dual-buffered hw-render FBOs, mirroring RetroArch's gl2 renderchain
-// (gl2_get_current_framebuffer returns hw_render_fbo[(tex_index+1)%
-// textures]; the present samples the completed previous frame). The core
-// renders into ma_gl_fbo[ma_gl_fbo_write] and the present samples
-// ma_gl_fbo_tex[(ma_gl_fbo_write+1)%2] -- the frame completed last
-// present -- so the same texture is never sampled in the same frame it
-// was rendered to (RTT-vs-sample hazard on Mali).
-#define MA_GL_FBO_COUNT 2
-static GLuint ma_gl_fbo[MA_GL_FBO_COUNT] = { 0 };
-static GLuint ma_gl_fbo_tex[MA_GL_FBO_COUNT] = { 0 };
-static GLuint ma_gl_fbo_rb[MA_GL_FBO_COUNT] = { 0 };
-static bool ma_gl_fbo_valid = false;
-static unsigned ma_gl_fbo_write = 0; // core render target index
-static unsigned ma_gl_fbo_dim_cur = 0; // actual created size (RA tex_w)
-
 // Called by the core (through glsm) to resolve GL function pointers.
 // Our context is a plain SDL GL context, so SDL_GL_GetProcAddress covers
 // everything (it wraps eglGetProcAddress on the mali winsys).
@@ -96,23 +115,30 @@ static retro_proc_address_t ma_gl_get_proc_address(const char *sym) {
 }
 
 // Returns the frontend FBO the core should render into. Must be current and
-// complete before the core's context_reset runs (glsm reads it in SETUP).
-// RA semantics (gl2_get_current_framebuffer): the core renders into the
-// (tex_index+1) slot and the renderchain flips tex_index to that slot before
-// sampling it -- write slot and sampled slot are the SAME texture, rotated
-// across frames. So: core renders fbo[(write+1)%2], the present flips write
-// to that slot and samples fbo[write].
+// complete before the core's context_reset runs (glsm reads it in SETUP and
+// caches it as `default_framebuffer`; mupen glsm.c:3049, flycast glsm.c:2759).
+// RA: the one hw-render FBO, returned as-is -- no index arithmetic.
 static uintptr_t ma_gl_get_current_framebuffer(void) {
-	return ma_gl_fbo_valid ? (uintptr_t)ma_gl_fbo[(ma_gl_fbo_write + 1) % MA_GL_FBO_COUNT] : 0;
+	return ma_gl_fbo_valid ? (uintptr_t)ma_gl_fbo[0] : 0;
 }
 
-// Index of the texture the present path samples: the slot the core rendered
-// into THIS frame (= write after the flip at the end of the present).
+// The texture the present path samples: the colour attachment of that same
+// FBO, bound after glBindFramebuffer(GL_FRAMEBUFFER, 0) so this is not a
+// render-to-sampled-texture feedback loop. RA does the same: gl3 samples
+// hw_render_texture (gl3.c:2782), gl2 samples gl->texture[0] which is
+// attached to hw_render_fbo[0].
 static GLuint ma_gl_sample_tex(void) {
-	return ma_gl_fbo_tex[ma_gl_fbo_write];
+	return ma_gl_fbo_tex[0];
 }
 
-static bool ma_gl_create_fbo(void) {
+// The depth/stencil attachment follows the CORE'S REQUEST, exactly like RA
+// (gl3.c:2086-2099): no depth at all when hwr->depth is 0, a depth-only
+// DEPTH_COMPONENT16 + GL_DEPTH_ATTACHMENT when the core asked for depth but
+// not stencil, and DEPTH24_STENCIL8 + GL_DEPTH_STENCIL_ATTACHMENT otherwise.
+// Attaching both unconditionally desyncs glsm's framebuffer bookkeeping: it
+// records the attachment it sees on GL_DEPTH_ATTACHMENT (glsm.c:3063) and
+// re-attaches it later on restore.
+static bool ma_gl_create_fbo(int depth, int stencil) {
 	unsigned dim = ma_gl_fbo_dim();
 	if (dim < 1) dim = 1;
 	for (unsigned i = 0; i < MA_GL_FBO_COUNT; i++)
@@ -126,18 +152,23 @@ static bool ma_gl_create_fbo(void) {
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-		// flycast glClears depth|stencil every frame -> FBO needs both.
-		glGenRenderbuffers(1, &ma_gl_fbo_rb[i]);
-		glBindRenderbuffer(GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
-		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
-				dim, dim);
+		if (depth) {
+			glGenRenderbuffers(1, &ma_gl_fbo_rb[i]);
+			glBindRenderbuffer(GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
+			glRenderbufferStorage(GL_RENDERBUFFER,
+					stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16,
+					dim, dim);
+			glBindRenderbuffer(GL_RENDERBUFFER, 0);
+		}
 
 		glGenFramebuffers(1, &ma_gl_fbo[i]);
 		glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_fbo[i]);
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 				GL_TEXTURE_2D, ma_gl_fbo_tex[i], 0);
-		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-				GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
+		if (depth)
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER,
+					stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+					GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
 
 		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
 			ma_gl_fbo_valid = false;
@@ -151,7 +182,6 @@ static bool ma_gl_create_fbo(void) {
 
 	if (!ma_gl_fbo_valid)
 		LOG_error("minarch: hw-render FBO incomplete\n");
-	ma_gl_fbo_write = 0;
 	return ma_gl_fbo_valid;
 }
 
@@ -164,16 +194,34 @@ static void ma_gl_destroy_fbo(void) {
 		ma_gl_fbo[i] = ma_gl_fbo_tex[i] = ma_gl_fbo_rb[i] = 0;
 	}
 	ma_gl_fbo_valid = false;
-	ma_gl_fbo_write = 0;
 	ma_gl_fbo_dim_cur = 0;
 }
 
-// RA semantics (SET_SYSTEM_AV_INFO, runloop.c: no_video_reinit unless
-// max_width/max_height unchanged): when the core reports a larger max
-// geometry the hw-render FBOs must be rebuilt at the new RA size. Only the
-// frontend GL objects change; the core's context_reset is invoked again so
-// glsm re-reads get_current_framebuffer (RA re-inits the whole driver and
-// re-runs the core's context_reset the same way).
+// Follows a growing core max geometry (RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO).
+// RA answers that call with a full video-driver reinit when max_width or
+// max_height changed -- runloop.c:2772-2847 sets DRIVER_VIDEO_MASK and issues
+// CMD_EVENT_REINIT, i.e. context_destroy (core GL teardown) -> the driver's GL
+// objects are rebuilt at the new size -> context_reset. minarch's only hw
+// GL objects are these FBOs, so the same effect is: rebuild the FBO at the new
+// RA size, then re-run the core's context_reset so glsm re-reads
+// get_current_framebuffer.
+//
+// The FBO is NOT reused in place: the core caches the FBO name, so the new
+// name has to reach it. mupen's glsm makes the re-reset the only workable
+// carrier: with window_first already > 0, GLSM_CTL_STATE_CONTEXT_RESET runs
+// glsm_state_setup() (glsm.c:3365-3375) and that is what re-reads
+// default_framebuffer (glsm.c:3049); flycast calls GLSM_CTL_STATE_SETUP from
+// its own context_reset unconditionally (libretro.cpp:1154-1163). Calling the
+// core's context_destroy first would reset mupen's window_first to 0
+// (glsm.c:3281-3282) so the reset would take the "first reset" branch and skip
+// glsm_state_setup() entirely, leaving the core on the deleted FBO name.
+//
+// Not reached for the validated cores: both GLES cores report their final max
+// geometry before SET_HW_RENDER -- mupen has a static 640x480
+// (libretro.c:145-146) and flycast computes it from config::RenderResolution in
+// update_variables(true) (libretro.cpp:1818, 1022) before
+// set_opengl_hw_render (libretro.cpp:1921) -- so the FBO is built correct from
+// the start and this only fires if a core grows its max mid-game.
 void MA_GL_update_fbo_size(void) {
 	if (!ma_gl_fbo_valid) return;
 	unsigned dim = ma_gl_fbo_dim();
@@ -188,7 +236,7 @@ void MA_GL_update_fbo_size(void) {
 		ma_gl_fbo_dim_cur, ma_gl_fbo_dim_cur, dim, dim,
 		core.max_width, core.max_height);
 	ma_gl_destroy_fbo();
-	if (!ma_gl_create_fbo()) return;
+	if (!ma_gl_create_fbo(hw_render.depth, hw_render.stencil)) return;
 	if (hw_render.context_reset)
 		hw_render.context_reset();
 }
@@ -329,9 +377,9 @@ static bool ma_gl_present_init(void) {
 //                    the screen and the symmetric overflow is clipped by the
 //                    viewport. HDMI falls back to NATIVE (minarch rule,
 //                    ma_video.c:451).
-// We do NOT call the software functions (setRectToAspectRatio dereferences
-// the software-only vid.blit state machine); the viewport math below is
-// taken verbatim from the RA GLES viewport code referenced above.
+// No software scaler helper is involved (the CPU rect/scale functions the
+// upstream software path used are gone); the viewport math below is taken
+// verbatim from the RA GLES viewport code referenced above.
 //
 // width/height: the frame's DISPLAY geometry -- for rotated games pass the
 // width/height-swapped dims (quad path), mirroring RA's rotation handling.
@@ -366,21 +414,25 @@ void PLAT_compute_present_rect(int width, int height,
 	// stores the unrotated aspect and applies core_requested_rotation on
 	// top. minarch has no such split: what the core reports is what we
 	// fit.
+	// RA: aspect <= 0 means "core did not provide one"; the fallback is the
+	// BASE geometry ratio (video_driver.c:2574-2577, and the libretro
+	// contract: "If zero or less, an aspect ratio of base_width /
+	// base_height is assumed") -- not the frame size.
 	double desired = (scaling == SCALE_ASPECT_SCREEN)
 		? (double)width / height
-		: (core.aspect_ratio > 0 ? core.aspect_ratio : (double)width / height);
+		: (core.aspect_ratio > 0 ? core.aspect_ratio
+				: (core.base_width && core.base_height
+					? (double)core.base_width / core.base_height
+					: (double)width / height));
 
 	if (scaling == SCALE_NATIVE || scaling == SCALE_CROPPED)
 	{
 		// video_viewport_get_scaled_integer (retroarch19.c:32567): integer
-		// scale of the core base geometry. minarch does not cache
-		// base_width/base_height, but flycast's reported base (640x480)
-		// equals the presented frame and the software scaler uses the frame
-		// size as its integer base too, so base == frame here. base_w is the
-		// square-pixel correction base_h * aspect (retroarch19.c:32610;
-		// aspect == core-reported ratio, which for flycast matches the frame;
-		// for rotated games the passed dims are already swapped, so the base
-		// follows the rotation the way RA swaps base_height, :32598).
+		// scale of the core *frame* size (RA uses frame_cache_width/height
+		// with a base-geometry fallback when <= 4, video_driver.c:2869-2880),
+		// so the frame height is the integer base here -- core.base_* only
+		// backs the aspect fallback above. base_w is the square-pixel
+		// correction base_h * aspect (retroarch19.c:32610).
 		unsigned base_h = (height > 0) ? height : 1;
 		unsigned base_w = (unsigned)roundf(base_h * (float)desired);
 		if (DEVICE_WIDTH >= (int)base_w && DEVICE_HEIGHT >= (int)base_h)
@@ -508,86 +560,14 @@ static void ma_gl_present_draw(const GLfloat *coords) {
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
-// Draw a passthrough quad for the Screen Effect / Overlay textures. Unlike
-// the FBO texture (content anchored at its GL bottom-left, v up), these RGBA
-// surfaces have row 0 at the TOP, so v runs top-down on screen; UVs span the
-// whole texture. The caller must have blending enabled (alpha compositing)
-// and the present program + VAO/VBO already bound.
-// Alpha-preserving passthrough program for the frontend's RGBA overlay
-// surfaces (Screen Effect, Overlay, hw-render debug HUD).  The present
-// program's fragment shader is RA's modern_opaque and forces alpha = 1 to keep
-// 32-bit game textures from going black, and its vertex shader applies uMvp to
-// already-clip-space vertices -- so overlay PNGs must NOT be drawn with it:
-// their transparency would be lost (an opaque rectangle over the game) and the
-// leftover uMvp would displace the quad.  Same contract as the software path's
-// s_pass_overlay (factory overlay.glsl): plain texture passthrough, alpha kept,
-// SRC_ALPHA blending.
-static const char *ma_gl_overlay_vs =
-	"#version 300 es\n"
-	"layout(location = 0) in vec2 aPos;\n"
-	"layout(location = 1) in vec2 aTex;\n"
-	"out vec2 vTex;\n"
-	"void main() { vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
-static const char *ma_gl_overlay_fs =
-	"#version 300 es\n"
-	"precision mediump float;\n"
-	"in vec2 vTex;\n"
-	"uniform sampler2D uTex;\n"
-	"out vec4 fragColor;\n"
-	"void main() { fragColor = texture(uTex, vTex); }\n";
-static GLuint ma_gl_overlay_prog = 0;
-static GLint  ma_gl_overlay_tex_loc = -1;
-
-// Lazy program init (the GL context is current at every call site).  Draws
-// through the shared present VBO/attrib layout (locations 0/1) that
-// ma_gl_present_draw sets up.
-static void ma_gl_overlay_use(void) {
-	if (!ma_gl_overlay_prog) {
-		GLuint vs = ma_gl_compile_shader(GL_VERTEX_SHADER, ma_gl_overlay_vs);
-		GLuint fs = ma_gl_compile_shader(GL_FRAGMENT_SHADER, ma_gl_overlay_fs);
-		if (vs && fs) {
-			ma_gl_overlay_prog = glCreateProgram();
-			glAttachShader(ma_gl_overlay_prog, vs);
-			glAttachShader(ma_gl_overlay_prog, fs);
-			glBindAttribLocation(ma_gl_overlay_prog, 0, "aPos");
-			glBindAttribLocation(ma_gl_overlay_prog, 1, "aTex");
-			glLinkProgram(ma_gl_overlay_prog);
-			ma_gl_overlay_tex_loc = glGetUniformLocation(ma_gl_overlay_prog, "uTex");
-		}
-		if (vs) glDeleteShader(vs);
-		if (fs) glDeleteShader(fs);
-		if (!ma_gl_overlay_prog)
-			LOG_error("minarch: overlay shader link failed\n");
-	}
-	glUseProgram(ma_gl_overlay_prog);
-	if (ma_gl_overlay_tex_loc >= 0) glUniform1i(ma_gl_overlay_tex_loc, 0);
-}
-
-static void ma_gl_draw_overlay_quad(int x, int y, int w, int h, GLuint tex) {
-	float cx0 = 2.0f * x / DEVICE_WIDTH - 1.0f;
-	float cx1 = 2.0f * (x + w) / DEVICE_WIDTH - 1.0f;
-	float cy0 = 1.0f - 2.0f * (y + h) / DEVICE_HEIGHT; // bottom
-	float cy1 = 1.0f - 2.0f * y / DEVICE_HEIGHT;       // top
-
-	// RA set_coords buffer layout: [vx..vy.. u.. v..]; NDC positions (old
-	// layout kept for the overlay: viewport is fullscreen here), row 0 of
-	// the surface (image top) maps to v = 0 (screen top).
-	float coords[16] = {
-		cx0, cy0,  cx1, cy0,  cx0, cy1,  cx1, cy1,   // vertex
-		0.f, 1.f,  1.f, 1.f,  0.f, 0.f,  1.f, 0.f,   // texcoord
-	};
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, tex);
-	// Own program, sampler and blend state (GL discipline: never inherit a
-	// binding).  The filter matches what the software path sets on these
-	// textures (generic_video.c upload block): NEAREST.
-	ma_gl_overlay_use();
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	ma_gl_present_draw(coords);
-}
+// RGBA overlay surfaces (Screen Effect, Overlay, Notification, hw-render debug
+// HUD) are composited by the ONE shared stage PLAT_composite_overlays
+// (generic_video.c), through the factory overlay pass. There is deliberately no
+// second overlay program here: the present program cannot carry them (its
+// fragment shader is RA modern_opaque and forces alpha = 1; its vertex shader
+// applies uMvp to already-clip-space vertices), and a private copy would drift
+// from the software path's composite -- the previous ma_gl_overlay_prog did
+// exactly that and never drew notifications at all.
 
 // ===== Shader-chain source normalization (P2, NextUI contract) =====
 // The chain's pass shaders derive their pattern from TextureSize/InputSize,
@@ -695,6 +675,22 @@ static int ma_gl_normalize_source(unsigned width, unsigned height) {
 	return 1;
 }
 
+// Last presented frame size, retained so the present draw can be replayed into
+// an offscreen target by PLAT_GL_screenCapture (see MA_GL_present_draw).
+static unsigned ma_gl_present_w = 0, ma_gl_present_h = 0;
+
+
+
+static void ma_gl_present_quad(unsigned width, unsigned height);
+
+// Re-draw the last presented frame (game + chain + overlays) into whatever
+// framebuffer is bound -- the default one, or the capture target while
+// PLAT_GL_screenCapture replays it.
+void MA_GL_present_draw(void) {
+	if (!ma_gl_present_w || !ma_gl_present_h) return;
+	ma_gl_present_quad(ma_gl_present_w, ma_gl_present_h);
+}
+
 static void ma_gl_present_quad(unsigned width, unsigned height) {
 	if (!ma_gl_present_prog && !ma_gl_present_init())
 		return;
@@ -761,7 +757,8 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	// shifted left with an empty band). This does not touch bindings;
 	// glsm's next STATE_BIND restores the core's FBO
 	// (default_framebuffer == ma_gl_fbo) at the start of retro_run.
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	// Default framebuffer, or the offscreen capture target during a replay.
+	glBindFramebuffer(GL_FRAMEBUFFER, PLAT_chain_present_target());
 	// RA gl2_set_viewport: viewport = the aspect-fit pixel rect (unit quad +
 	// ortho MVP map into it). Fullscreen only implicitly for full coverage.
 	glViewport(dst_x, dst_y, dst_w, dst_h);
@@ -860,28 +857,26 @@ static void ma_gl_present_quad(unsigned width, unsigned height) {
 	}
 	GFX_setEffectScale(fx_scale);
 	GFX_prepare_overlay_textures();
-	// The shader chain runs on its own program (VAO 0 global attribs) and
+	// Overlay composite: the ONE shared stage (generic_video.c
+	// PLAT_composite_overlays), the same call the software present makes --
+	// Screen Effect -> Overlay -> Notification, all through the factory
+	// overlay pass. ma_gl.c used to carry a second implementation of this
+	// (ma_gl_overlay_prog/ma_gl_draw_overlay_quad) which also silently never
+	// drew notifications for hw-render cores (PLAT_GL_Swap is software-only).
+	//
+	// The chain runs on its own program (default VAO 0 global attribs) and
 	// leaves the viewport at the final pass's rect, and may leave TEXTURE1
-	// bound; re-establish the present program's state (fullscreen viewport,
-	// no scissor) before overlaying. ma_gl_present_draw re-uploads the quad
-	// and attributes on the default VAO.
+	// bound; reset those before overlaying. The shared stage re-establishes
+	// its own program, VBO/attribs, filter and blend per pass.
 	glUseProgram(ma_gl_present_prog);
 	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
 	glDisable(GL_SCISSOR_TEST);
 	glActiveTexture(GL_TEXTURE1);
 	glBindTexture(GL_TEXTURE_2D, 0);
 	glActiveTexture(GL_TEXTURE0);
-	int fx_w = 0, fx_h = 0, ov_w = 0, ov_h = 0;
-	GLuint fx_tex = GFX_effect_texture(&fx_w, &fx_h);
-	GLuint ov_tex = GFX_overlay_texture(&ov_w, &ov_h);
-	if (fx_tex || ov_tex) {
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		if (fx_tex && fx_w > 0 && fx_h > 0)
-			ma_gl_draw_overlay_quad(dst_x, dst_y, fx_w, fx_h, fx_tex);
-		if (ov_tex && ov_w > 0 && ov_h > 0)
-			ma_gl_draw_overlay_quad(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, ov_tex);
-	}
+	PLAT_composite_overlays(dst_x, dst_y,
+			(GFX_shaders_active() && ma_gl_chain_tex)
+				? ma_gl_chain_tex : ma_gl_sample_tex());
 }
 
 void MA_GL_set_rotation(unsigned rotation) {
@@ -910,12 +905,17 @@ bool MA_GL_set_hw_render(struct retro_hw_render_callback *cb) {
 	SDL_GLContext ctx = PLAT_getGLContext();
 	if (win && ctx) SDL_GL_MakeCurrent(win, ctx);
 
-	// RA semantics: the hw-render FBO size follows the core's reported av_info
-	// geometry max (gl2 tex_w = next_pow2(max_dim)); RA resolves av_info before
-	// its driver builds the FBOs. minarch builds them inside SET_HW_RENDER
-	// (during load_game), so resolve the geometry here -- otherwise the first
-	// FBO is built from max=0 (256^2) and must be rebuilt mid-game, which
-	// re-runs the core's context_reset while its render thread is live.
+	// RA builds its hw-render FBO from the av_info geometry max
+	// (video_driver.c:4602-4604 -> gl2.c:5415 / gl3.c:3239), and RA has that
+	// av_info in hand before it creates the driver because it resolves content
+	// av_info first. Our FBO is created here, inside SET_HW_RENDER (which both
+	// GLES cores emit from within retro_load_game), so resolve the geometry
+	// now: at this point both cores already report their final max
+	// (mupen: static 640x480, libretro.c:145-146; flycast: set from
+	// config::RenderResolution in update_variables(true), libretro.cpp:1818 +
+	// 1022, before set_opengl_hw_render at :1921). RA's rule for a core that
+	// reports a larger max later is a full video-driver reinit -- see
+	// MA_GL_update_fbo_size().
 	if (core.get_system_av_info) {
 		struct retro_system_av_info av = {};
 		core.get_system_av_info(&av);
@@ -923,34 +923,48 @@ bool MA_GL_set_hw_render(struct retro_hw_render_callback *cb) {
 		core.max_height = av.geometry.max_height;
 	}
 
-	// Frontend FBO must exist before the core's context_reset (glsm reads
-	// get_current_framebuffer during SETUP and caches the id).
-	if (!ma_gl_fbo_valid && !ma_gl_create_fbo())
-		return false;
-
-	// Stash the core's callbacks before overwriting the fields we own.
+	// RA creates the hw-render FBO in video_driver_init_internal() and calls
+	// hwr->context_reset() immediately after it (retroarch.c:1647-1648). The
+	// core's glsm reads get_current_framebuffer() while handling that reset
+	// (SETUP caches it: mupen glsm.c:3049, flycast glsm.c:2759), so the FBO
+	// must exist first.
+	// Stash the core's request before anything else: the FBO's depth/stencil
+	// attachments are part of it.
 	hw_render = *cb;
 
-	// Frontend-owned fields.
+	if (!ma_gl_fbo_valid && !ma_gl_create_fbo(hw_render.depth, hw_render.stencil))
+		return false;
+
+	// Frontend-owned fields (RA overwrites exactly these: get_proc_address and
+	// get_current_framebuffer). cache_context is the CORE's request
+	// (libretro.h:2874-2878: "the frontend will go very far to avoid resetting
+	// context"), and RA never rewrites it -- we do not either: this frontend
+	// never resets the context after load, so honouring it is accurate.
 	hw_render.get_proc_address      = ma_gl_get_proc_address;
 	hw_render.get_current_framebuffer = ma_gl_get_current_framebuffer;
-	hw_render.cache_context         = false;
 
 	// Give the core back the filled-in struct.
 	*cb = hw_render;
 
 	hw_render_active = true;
-	LOG_info("minarch: GLES hardware render enabled (context_type=%d, reset=%p, destroy=%p, fbo[%u]=%u/%u)\n",
+	LOG_info("minarch: GLES hardware render enabled (context_type=%d, reset=%p, destroy=%p, fbo=%u tex=%u dim=%u depth=%d stencil=%d bottom_left=%d cache_context=%d)\n",
 		hw_render.context_type, (void*)hw_render.context_reset, (void*)hw_render.context_destroy,
-		ma_gl_fbo_write, (unsigned)ma_gl_fbo[0], (unsigned)ma_gl_fbo[1]);
+		(unsigned)ma_gl_fbo[0], (unsigned)ma_gl_fbo_tex[0], ma_gl_fbo_dim_cur,
+		(int)hw_render.depth, (int)hw_render.stencil,
+		(int)hw_render.bottom_left_origin, (int)hw_render.cache_context);
 
-	// Context reset must happen *before* the core's retro_load_game returns:
-	// flycast (ThreadedRendering) starts its emu thread inside load_game (after
-	// setting AV info), and that thread begins rendering immediately. If we
-	// defer context_reset until after load_game, the emu thread renders with
-	// uninitialized glsm symbols -> SIGSEGV @ (nil). Our SDL GL context is
-	// already current here (UI init), so it's safe to reset right away.
-	MA_GL_context_reset();
+	// Do NOT run the core's context_reset from here. Both GLES cores negotiate
+	// hw render from *inside* retro_load_game (flycast: shell/libretro
+	// set_opengl_hw_render; mupen64plus_next: libretro-common
+	// glsm_state_ctx_init -> SET_HW_RENDER), and RA's context_reset is not
+	// reachable from there: it is called by drivers_init() after
+	// video_driver_init_internal() (retroarch.c:1647-1648), and drivers_init
+	// runs after retro_load_game has returned. mupen64plus_next makes the
+	// difference observable: its glsm treats a reset with window_first > 0 as a
+	// window change and runs retroChangeWindow() (glsm.c:3365-3375), which
+	// tears down GLideN64's drawer before RomOpen has created it (SIGSEGV in
+	// Context::deleteFramebuffer). The one reset is issued after load_game
+	// returns, from Core_load(); see ma_core.c.
 	return true;
 }
 
@@ -985,72 +999,6 @@ void MA_GL_context_destroy(void) {
 	ma_gl_destroy_fbo();
 }
 
-// ---------------------------------------------------------------------------
-// hw-render debug HUD (flycast etc.).  hw-render cores never deliver a CPU
-// frame, and minarch's original HUD (ma_video.c PLAT_draw_debug_hud) stamps
-// its bitmap text into exactly such a frame -- so the SAME function runs here,
-// onto a frontend RGBA surface, and the result is composited as one more
-// overlay quad through ma_gl_draw_overlay_quad.  No second HUD implementation,
-// no TTF panel and no seqlock handoff.
-//
-// It is rasterized on the core's video thread, which is where the software
-// path runs the same function (upstream calls drawDebugHud from the video
-// callback), so the threading model and the globals it reads (perf, renderer)
-// are unchanged.  Half device resolution on a fullscreen quad reproduces the
-// ~2x apparent text size the software path gets from its integer upscale.
-// ---------------------------------------------------------------------------
-static uint32_t *ma_gl_hud_surface = NULL;
-static int ma_gl_hud_w = 0, ma_gl_hud_h = 0;
-static GLuint ma_gl_hud_tex = 0;
-static int ma_gl_hud_tex_sized = 0;
-
-static void ma_gl_draw_debug_hud(void) {
-	if (!show_debug || SDL_GetTicks() < 5000) return;
-
-	int w = DEVICE_WIDTH / 2, h = DEVICE_HEIGHT / 2;
-	if (w <= 0 || h <= 0) return;
-	if (!ma_gl_hud_surface || ma_gl_hud_w != w || ma_gl_hud_h != h) {
-		free(ma_gl_hud_surface);
-		ma_gl_hud_surface = calloc((size_t)w * (size_t)h, 4);
-		ma_gl_hud_w = w;
-		ma_gl_hud_h = h;
-		ma_gl_hud_tex_sized = 0;
-	}
-	if (!ma_gl_hud_surface) return;
-
-	// Transparent background: the HUD's black text boxes and white glyphs are
-	// opaque, everything else blends through to the game frame.
-	memset(ma_gl_hud_surface, 0, (size_t)w * (size_t)h * 4);
-	PLAT_draw_debug_hud(ma_gl_hud_surface, (unsigned)w, (unsigned)h,
-			(size_t)w * 4, RETRO_PIXEL_FORMAT_XRGB8888);
-
-	if (!ma_gl_hud_tex) {
-		glGenTextures(1, &ma_gl_hud_tex);
-		if (!ma_gl_hud_tex) return;
-	}
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, ma_gl_hud_tex);
-	if (!ma_gl_hud_tex_sized) {
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
-				GL_UNSIGNED_BYTE, ma_gl_hud_surface);
-		ma_gl_hud_tex_sized = 1;
-	} else {
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA,
-				GL_UNSIGNED_BYTE, ma_gl_hud_surface);
-	}
-
-	// Own draw state, then the shared overlay quad (which brings its own
-	// program, filter and blend function).
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT);
-	glDisable(GL_SCISSOR_TEST);
-	glDisable(GL_DEPTH_TEST);
-	glDisable(GL_CULL_FACE);
-	glDisable(GL_STENCIL_TEST);
-	ma_gl_draw_overlay_quad(0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, ma_gl_hud_tex);
-}
-
-
 void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
 	if (!hw_render_active) return;
 	// RetroArch semantics (gfx_video_driver.c video_driver_frame): the driver
@@ -1069,16 +1017,20 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	// frame (the core reports its internal framebufferWidth -- e.g. the
 	// 853x480 startup estimate -- which is not the presented frame size).
 	static unsigned last_w = 0, last_h = 0;
-	// Dual-buffer rotation (RA gl2 semantics, gl2.c:4163-4164): the core
-	// rendered into fbo[(write+1)%2] this frame; flip write to that slot so
-	// the present samples what the core just drew. A dupe (data == NULL)
-	// does NOT flip: the core produced no new frame, so we re-present the
-	// same slot (RA keeps tex_index stable on dupes and re-samples it).
+	// No index rotation: the core renders into the one FBO (glsm cached its
+	// id at SETUP) and the present samples that same FBO texture, so there is
+	// nothing to flip -- RA's gl2 flip at gl2.c:4163-4164 is a no-op for
+	// hw render (textures == 1) and gl3 has no index at all. On a dupe the
+	// texture simply still holds the previous frame, which is what we
+	// re-present.
 	if (data == VALID) {
 		last_w = width; last_h = height;
-		ma_gl_fbo_write = (ma_gl_fbo_write + 1) % MA_GL_FBO_COUNT;
 	}
 	if (last_w) { width = last_w; height = last_h; }
+	// RA gl3.c:4773-4776: a zero reported size is fixed up to 1 so the
+	// viewport math never divides by zero.
+	if (!width) width = 1;
+	if (!height) height = 1;
 
 	// RA video_driver_frame semantics: a dupe (data == NULL) carries no new
 	// pixels, so the driver frame is not re-run -- RA skips that frame whole.
@@ -1108,10 +1060,15 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	static uint64_t mg_freq = 0;
 	if (!mg_freq) mg_freq = SDL_GetPerformanceFrequency();
 	uint64_t mg_t0 = SDL_GetPerformanceCounter();
+	// The one hw-render present draw: normalize -> shader chain -> overlays.
+	ma_gl_present_w = width;
+	ma_gl_present_h = height;
+	// The debug HUD is NOT drawn here any more: it is one layer of the shared
+	// overlay composite (generic_video.c PLAT_composite_overlays), which
+	// ma_gl_present_quad already ran, so the hw-render HUD is produced by the
+	// same code, at the same point, as the software path's.
 	ma_gl_present_quad(width, height);
-	// Composite the HUD in the same place RA draws its widgets: end of the
-	// driver frame.
-	ma_gl_draw_debug_hud();
+
 	{
 		uint64_t us = (SDL_GetPerformanceCounter() - mg_t0) * 1000000ull / (mg_freq ? mg_freq : 1);
 		mg_draw_us_sum += us;
@@ -1156,16 +1113,18 @@ void MA_GL_present_from_loop(void) {
 	MA_present_frame();
 }
 
-// Re-make our GL context current after any frontend UI activity that may have
-// switched to another context (the SDL_Renderer used by the in-game menu owns
-// a SEPARATE GLES2 context and leaves it current). Without this, the first
-// retro_run after the menu runs flycast's glsm STATE_BIND + RenderFrame with
-// the renderer's context current: its FBO/texture ids then refer to phantom
-// objects in that context, so the frame renders nowhere (frozen frame) and
-// the GLCache/glsm shadow state gets polluted, which surfaces as rendering
-// corruption after closing the menu. The game present path (MA_GL_video_refresh)
-// already makes this context current every frame, so this only matters for the
-// window between Menu_loop and the next retro_run.
+
+// Re-make our GL context current after frontend UI activity, so the next
+// retro_run's glsm STATE_BIND + core render start from a known-current
+// context: flycast/GLideN64 cache GL object wrappers (GLCache / Context), and
+// a core that binds with the wrong context current renders into phantom
+// objects (frozen frame) while polluting its shadow state (rendering
+// corruption after the menu). The frontend owns exactly ONE GL context
+// (generic_video.c:625); the original need came from the deleted
+// SDL_Renderer's separate context, and the call is kept as the explicit
+// ordering point (one MakeCurrent, idempotent). The game present path
+// (MA_GL_video_refresh) makes it current every frame anyway, so this only
+// matters for the window between Menu_loop and the next retro_run.
 void MA_GL_make_current(void) {
 	if (!hw_render_active) return;
 	SDL_Window *win = PLAT_getGLWindow();

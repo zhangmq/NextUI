@@ -199,10 +199,10 @@ int main(int argc , char* argv[]) {
 	Menu_setCoreVersionDesc(core.version);
 	Core_load();
 
-	// GLES hardware-render cores (flycast) negotiate the GL context during
-	// retro_load_game; MA_GL_set_hw_render already ran context_reset inside
-	// the SET_HW_RENDER callback (before load_game returned), so the core's
-	// emu thread has a valid GL context from the start.
+	// GLES hardware-render cores negotiate the GL context during
+	// retro_load_game; the core's context_reset is run once after load_game
+	// returns (Core_load -> MA_GL_context_reset), never from inside
+	// SET_HW_RENDER. See the comment in MA_GL_set_hw_render().
 	
 	Input_init(NULL);
 	Config_readOptions(); // but others load and report options later (eg. nes)
@@ -270,7 +270,25 @@ int main(int argc , char* argv[]) {
 		 * RA-style pace composition). */
 		ma_audio_wrote_frame = 0;
 
+		/* RA core_run's early poll: a core that asked for EARLY through
+		 * RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE does not own the poll (RA
+		 * core_run:9116-9117) -- flycast and mupen64plus-next announce it
+		 * whenever their threaded renderer is on, and mupen then never calls
+		 * poll_cb at all (mupen64plus-core/src/main/main.c:259-263). Under an
+		 * override the core's callback is a no-op (core_input_poll_callback),
+		 * so the frame contains exactly one poll: this one, or the LATE one
+		 * below. With the default value (0) nothing changes: the core polls.
+		 * Known interaction: the rewind-wait paths in run_frame poll by
+		 * themselves, so an override core would poll twice on those frames
+		 * (rewind engaged only). RA guards the same case with
+		 * RETRO_CORE_FLAG_INPUT_POLLED. */
+		if (input_poll_type_override == 1)
+			input_poll_callback();
+
 		run_frame();
+
+		if (input_poll_type_override == 2)
+			input_poll_callback();
 
 		// Hardware-render present, on this thread and once per frame -- the
 		// software path presents from its video callback (also this thread).
@@ -341,14 +359,17 @@ int main(int argc , char* argv[]) {
 			chooseSyncRef();
 		}
 
+
 		if (show_menu) {
 			PWR_updateFrequency(PWR_UPDATE_FREQ,1);
 			Menu_loop();
-			// The menu presents via the SDL_Renderer, which owns a separate
-			// GLES2 context and leaves it current. Re-make our hw-render GL
-			// context current so the next retro_run's glsm BIND + core render
-			// execute in the right context (otherwise flycast renders into
-			// phantom objects and its GLCache shadow state gets polluted).
+			// The menu runs on the one GL context this frontend owns
+			// (generic_video.c:625) and composites its CPU surfaces through the
+			// shared ui_layer path, so nothing else can leave another context
+			// current. Re-make ours anyway before the next retro_run's glsm
+			// BIND + core render: it is one MakeCurrent and it keeps the call
+			// order explicit for the cores that cache GL object wrappers
+			// (flycast's GLCache, GLideN64's Context).
 			MA_GL_make_current();
 			// Process RA async operations while menu is shown
 			RA_idle();

@@ -18,6 +18,7 @@
 #include "platform.h"
 #include "api.h"
 #include "ma_chain.h"   // shader chain moved out (see ma_chain.h)
+#include "ma_gl.h"      // hw-render present replay (PLAT_GL_screenCapture)
 #include "utils.h"
 #include <stdlib.h>
 #include <pthread.h>
@@ -42,31 +43,11 @@ int ma_gl_vsync_active = 0;
 
 #include "ma_present.h"   // one present for the whole frontend
 
-static SDL_BlendMode getPremultipliedBlendMode(void) {
-	return SDL_ComposeCustomBlendMode(
-		SDL_BLENDFACTOR_ONE,
-		SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-		SDL_BLENDOPERATION_ADD,
-		SDL_BLENDFACTOR_ONE,
-		SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-		SDL_BLENDOPERATION_ADD
-	);
-}
 
 // shader stuff
 
 static struct VID_Context {
 	SDL_Window* window;
-	SDL_Renderer* renderer;
-	SDL_Texture* target_layer1;
-	SDL_Texture* target_layer2;
-	SDL_Texture* stream_layer1;
-	SDL_Texture* target_layer3;
-	SDL_Texture* target_layer4;
-	SDL_Texture* target_layer5;
-	SDL_Texture* target;
-	SDL_Texture* effect;
-	SDL_Texture* overlay;
 	SDL_Surface* screen;
 	SDL_GLContext gl_context;
 
@@ -616,20 +597,10 @@ SDL_Surface* PLAT_initVideo(void) {
 		LOG_error("SDL_CreateWindow failed: %s\n", SDL_GetError());
 		exit(1);
 	}
-	vid.renderer = SDL_CreateRenderer(vid.window,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
-	if (!vid.renderer) {
-		LOG_error("SDL_CreateRenderer failed: %s\n", SDL_GetError());
-		exit(1);
-	}
-	SDL_SetRenderDrawBlendMode(vid.renderer, SDL_BLENDMODE_BLEND);
-	SDL_RendererInfo info;
-	SDL_GetRendererInfo(vid.renderer, &info);
-	LOG_info("Current render driver: %s\n", info.name);
-	// print texture formats
-	LOG_info("Supported texture formats:\n");
-	for (Uint32 i=0; i<info.num_texture_formats; i++) {
-		LOG_info("- %s\n", SDL_GetPixelFormatName(info.texture_formats[i]));
-	}
+	// No SDL_Renderer: every frontend surface (game frame, menu/UI, effect,
+	// overlay, notification, HUD) is composited in the ONE GL context below.
+	// The SDL renderer used to own a second GLES2 context on this window purely
+	// for the menu path (see the GL UI compositor).
 
 	if(strcmp("Desktop", PLAT_getModel()) == 0) {
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
@@ -673,24 +644,8 @@ SDL_Surface* PLAT_initVideo(void) {
 			swap_ok ? "supported" : "unsupported by driver");
 	}
 
-	vid.stream_layer1 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w,h);
-	vid.target_layer1 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET , w,h);
-	vid.target_layer2 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET , w,h);
-	vid.target_layer3 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET , w,h);
-	vid.target_layer4 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET , w,h);
-	vid.target_layer5 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET , w,h);
-
-	vid.target	= NULL; // only needed for non-native sizes
-
 	vid.screen = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
-
-	SDL_BlendMode premult = getPremultipliedBlendMode();
 	SDL_SetSurfaceBlendMode(vid.screen, SDL_BLENDMODE_BLEND);
-	SDL_SetTextureBlendMode(vid.stream_layer1, premult);
-	SDL_SetTextureBlendMode(vid.target_layer2, premult);
-	SDL_SetTextureBlendMode(vid.target_layer3, SDL_BLENDMODE_BLEND); // straight alpha game art
-	SDL_SetTextureBlendMode(vid.target_layer4, premult);
-	SDL_SetTextureBlendMode(vid.target_layer5, SDL_BLENDMODE_BLEND);
 
 	vid.width	= w;
 	vid.height	= h;
@@ -750,46 +705,173 @@ void PLAT_setShaders(int nr) {
 	reloadShaderTextures = 1;
 }
 
-static void clearVideo(void) {
-	for (int i=0; i<3; i++) {
-		SDL_RenderClear(vid.renderer);
-		SDL_FillRect(vid.screen, NULL, vid.clear_color);
-		SDL_RenderCopy(vid.renderer, vid.stream_layer1, NULL, NULL);
-		SDL_RenderPresent(vid.renderer);
+// ---------------------------------------------------------------------------
+// GL UI compositor (in-game menu, menus, transitions).
+//
+// The menu draws its UI into a CPU surface. Upstream handed that surface to the
+// SDL renderer, which owns a SEPARATE GLES2 context on the same window: that is
+// a third presentation stack beside the software and hw-render GL paths, it
+// forces a context switch around every menu frame, and its background came from
+// a post-swap window readback. It is now composited in the SAME GL context as
+// the game frame, through the SAME factory overlay pass the Screen Effect /
+// Overlay / Notification composite uses (s_pass_ui == overlay.glsl with
+// premultiplied blending) -- one compositor for every frontend surface, and the
+// menu frame is just another RGBA overlay texture.
+//
+// Layer order matches the SDL present it replaces exactly:
+//   layer1 -> layer2 -> screen(UI) -> layer3 -> layer4 -> layer5
+// (slot 0 is the UI screen surface itself; the API's layer 0 maps to slot 1,
+// like upstream's `default: target_layer1`).
+// ---------------------------------------------------------------------------
+#define UI_LAYER_COUNT 6
+typedef struct {
+	GLuint tex;
+	int tex_w, tex_h;   // allocated texture size
+	int x, y, w, h;     // destination rect, device pixels
+	int valid;
+} UILayer;
+static UILayer ui_layers[UI_LAYER_COUNT];
+static uint32_t *ui_upload_buf = NULL;
+static size_t ui_upload_cap = 0;
+
+static int ui_layer_slot(int layer) {
+	if (layer < 1 || layer > 5) return 1; // upstream: default -> target_layer1
+	return layer;
+}
+
+// ARGB8888 (SDL byte order B,G,R,A) -> tightly packed RGBA, scaling RGB
+// (brightness, = SDL_SetTextureColorMod) and A (opacity, =
+// SDL_SetTextureAlphaMod). Row-aware: the surface pitch is not assumed to be
+// w*4.
+static const void *ui_prepare_pixels(SDL_Surface *s, float brightness, float alpha_scale) {
+	size_t px = (size_t)s->w * (size_t)s->h;
+	if (px == 0) return NULL;
+	if (px > ui_upload_cap) {
+		free(ui_upload_buf);
+		ui_upload_buf = (uint32_t *)malloc(px * 4);
+		if (!ui_upload_buf) { ui_upload_cap = 0; return NULL; }
+		ui_upload_cap = px;
 	}
+	SDL_Surface *conv = NULL;
+	SDL_Surface *src_surface = s;
+	if (s->format->format != SDL_PIXELFORMAT_ARGB8888) {
+		conv = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+		if (!conv) return NULL;
+		src_surface = conv;
+	}
+	uint8_t *dst = (uint8_t *)ui_upload_buf;
+	for (int y = 0; y < src_surface->h; y++) {
+		const uint8_t *row = (const uint8_t *)src_surface->pixels + (size_t)y * src_surface->pitch;
+		for (int x = 0; x < src_surface->w; x++) {
+			uint8_t b = row[0], g = row[1], r = row[2], a = row[3];
+			if (brightness != 1.0f) {
+				r = (uint8_t)(r * brightness);
+				g = (uint8_t)(g * brightness);
+				b = (uint8_t)(b * brightness);
+			}
+			if (alpha_scale != 1.0f) a = (uint8_t)(a * alpha_scale);
+			dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
+			row += 4; dst += 4;
+		}
+	}
+	if (conv) SDL_FreeSurface(conv);
+	return ui_upload_buf;
+}
+
+static void ui_layer_upload(int slot, SDL_Surface *surface, int x, int y, int w, int h,
+		float brightness, float alpha_scale) {
+	if (!surface || slot < 0 || slot >= UI_LAYER_COUNT) return;
+	const void *pix = ui_prepare_pixels(surface, brightness, alpha_scale);
+	if (!pix) return;
+	UILayer *L = &ui_layers[slot];
+	if (!L->tex) glGenTextures(1, &L->tex);
+	glBindTexture(GL_TEXTURE_2D, L->tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	PLAT_gl_unpack_reset();
+	if (L->tex_w != surface->w || L->tex_h != surface->h) {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surface->w, surface->h, 0,
+				GL_RGBA, GL_UNSIGNED_BYTE, pix);
+		L->tex_w = surface->w;
+		L->tex_h = surface->h;
+	} else {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, surface->w, surface->h,
+				GL_RGBA, GL_UNSIGNED_BYTE, pix);
+	}
+	L->x = x; L->y = y; L->w = w; L->h = h;
+	L->valid = 1;
+}
+
+// Draw one layer through the shared overlay pass (its own program/VBO/attrib/
+// blend state per draw; see runShaderPass).
+static void ui_layer_draw(int slot) {
+	UILayer *L = &ui_layers[slot];
+	if (!L->valid || !L->tex || L->w <= 0 || L->h <= 0) return;
+	runShaderPass(&s_pass_ui, L->tex, L->tex, NULL, GL_NONE,
+			L->x, L->y, L->w, L->h, NULL, 0, 1);
+}
+
+// One UI present: clear to the configured background colour, then composite
+// layer1 -> layer2 -> UI screen -> layer3..5 and swap. This replaces
+// PLAT_flip's SDL-renderer path and is the only frontend present that is not a
+// game frame.
+static void ui_present(SDL_Surface *ui_surface) {
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	uint32_t c = vid.clear_color;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, device_width, device_height);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_BLEND);
+	glClearColor(((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+			(c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	if (ui_surface)
+		ui_layer_upload(0, ui_surface, 0, 0, device_width, device_height, 1.0f, 1.0f);
+
+	ui_layer_draw(1);
+	ui_layer_draw(2);
+	ui_layer_draw(0);
+	ui_layer_draw(3);
+	ui_layer_draw(4);
+	ui_layer_draw(5);
+
+	MA_present_frame();
+}
+
+static void clearVideo(void) {
+	// Flush a few black frames through the one GL present path.
+	if (!vid.screen) return;
+	SDL_FillRect(vid.screen, NULL, vid.clear_color);
+	for (int i=0; i<3; i++) ui_present(vid.screen);
 }
 
 void PLAT_quitVideo(void) {
 	clearVideo();
 
-	// Make sure the GL context is current before tearing down textures/renderer
+	// Make sure the GL context is current before tearing down GL objects.
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 
-	// Destroy textures while renderer is valid
-	if (vid.target) SDL_DestroyTexture(vid.target);
-	if (vid.effect) SDL_DestroyTexture(vid.effect);
-	if (vid.overlay) SDL_DestroyTexture(vid.overlay);
-	if (vid.target_layer3) SDL_DestroyTexture(vid.target_layer3);
-	if (vid.target_layer1) SDL_DestroyTexture(vid.target_layer1);
-	if (vid.target_layer2) SDL_DestroyTexture(vid.target_layer2);
-	if (vid.target_layer4) SDL_DestroyTexture(vid.target_layer4);
-	if (vid.target_layer5) SDL_DestroyTexture(vid.target_layer5);
-	if (vid.stream_layer1) SDL_DestroyTexture(vid.stream_layer1);
-
-	// Ensure all pending GL operations complete before destroying renderer/context
-	SDL_RenderFlush(vid.renderer);
+	for (int i = 0; i < UI_LAYER_COUNT; i++) {
+		if (ui_layers[i].tex) glDeleteTextures(1, &ui_layers[i].tex);
+		ui_layers[i].tex = 0;
+		ui_layers[i].valid = 0;
+	}
+	free(ui_upload_buf);
+	ui_upload_buf = NULL;
+	ui_upload_cap = 0;
 	glFinish();
 
-	// Destroy renderer BEFORE GL context - this stops rendering threads
-	SDL_DestroyRenderer(vid.renderer);
-	vid.renderer = NULL;
-
-	// Drop current context and delete
-	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	SDL_GL_MakeCurrent(NULL, NULL);
 	SDL_GL_DeleteContext(vid.gl_context);
 	vid.gl_context = NULL;
 	SDL_FreeSurface(vid.screen);
+	vid.screen = NULL;
 
 	// Cleanup and shutdown
 	SDL_DestroyWindow(vid.window);
@@ -804,17 +886,12 @@ void PLAT_clearVideo(SDL_Surface* screen) {
 	SDL_FillRect(screen, NULL, SDL_transparentBlack);
 }
 void PLAT_clearAll(void) {
-	// ok honestely mixing SDL and OpenGL is really bad, but hey it works just got to sometimes clear gpu stuff and pull context back to SDL
-	// so yeah clear all layers and pull a flip() to make it switch back to SDL before clearing
+	// Drop every UI layer, clear the UI surface and present once. Upstream
+	// bounced through the SDL renderer twice to "pull the context back to SDL";
+	// there is only one GL context now, so a clear + present is the whole job.
 	PLAT_clearLayers(0);
-	PLAT_flip(vid.screen,0);
-	PLAT_clearLayers(0);
-	PLAT_flip(vid.screen,0);
-
-	// then do normal SDL clearing stuff
 	PLAT_clearVideo(vid.screen);
-	SDL_SetRenderDrawColor(vid.renderer, 0, 0, 0, 0);
-	SDL_RenderClear(vid.renderer);
+	PLAT_flip(vid.screen, 0);
 }
 
 void PLAT_setVsync(int vsync) {
@@ -851,22 +928,8 @@ static void resizeVideo(int w, int h, int p) {
 
 	// LOG_info("resizeVideo(%i,%i,%i) hard_scale: %i crisp: %i\n",w,h,p, hard_scale,vid.sharpness==SHARPNESS_CRISP);
 
-	SDL_DestroyTexture(vid.stream_layer1);
-	if (vid.target) SDL_DestroyTexture(vid.target);
-
-	// SDL_SetHintWithPriority(SDL_HINT_RENDER_SCALE_QUALITY, vid.sharpness==SHARPNESS_SOFT?"1":"0", SDL_HINT_OVERRIDE);
-	vid.stream_layer1 = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w,h);
-	SDL_SetTextureBlendMode(vid.stream_layer1, getPremultipliedBlendMode());
-
-	if (vid.sharpness==SHARPNESS_CRISP) {
-		// SDL_SetHintWithPriority(SDL_HINT_RENDER_SCALE_QUALITY, "1", SDL_HINT_OVERRIDE);
-		vid.target = SDL_CreateTexture(vid.renderer,SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, w * hard_scale,h * hard_scale);
-	}
-	else {
-		vid.target = NULL;
-	}
-
-
+	// Only the frame description changes now: the present paths read their
+	// source dimensions from the caller, and there is no SDL texture to resize.
 	vid.width	= w;
 	vid.height	= h;
 	vid.pitch	= p;
@@ -1029,10 +1092,6 @@ void PLAT_setOffsetY(int y) {
 }
 static int overlayUpdated=0;
 void PLAT_setOverlay(const char* filename, const char* tag) {
-    if (vid.overlay) {
-        SDL_DestroyTexture(vid.overlay);
-        vid.overlay = NULL;
-    }
 	if (overlay_path) {
 		free(overlay_path);
 		overlay_path = NULL;
@@ -1090,160 +1149,31 @@ void applyRoundedCorners(SDL_Surface* surface, SDL_Rect* rect, int radius) {
 }
 
 void PLAT_clearLayers(int layer) {
-	if(layer==0 || layer==1) {
-		uint32_t bg = vid.clear_color;
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer1);
-		SDL_SetRenderDrawColor(vid.renderer, (bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF, 255);
-		SDL_RenderClear(vid.renderer);
-	}
-	SDL_SetRenderDrawColor(vid.renderer, 0, 0, 0, 0);
-	if(layer==0 || layer==2) {
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer2);
-		SDL_RenderClear(vid.renderer);
-	}
-	if(layer==0 || layer==3) {
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer3);
-		SDL_RenderClear(vid.renderer);
-	}
-	if(layer==0 || layer==4) {
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer4);
-		SDL_RenderClear(vid.renderer);
-	}
-	if(layer==0 || layer==5) {
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer5);
-		SDL_RenderClear(vid.renderer);
-	}
-
-	SDL_SetRenderTarget(vid.renderer, NULL);
+	// The UI present clears the framebuffer to vid.clear_color first, so an
+	// invalidated layer1 shows exactly what the SDL target clear showed.
+	if (layer==0 || layer==1) ui_layers[1].valid = 0;
+	if (layer==0 || layer==2) ui_layers[2].valid = 0;
+	if (layer==0 || layer==3) ui_layers[3].valid = 0;
+	if (layer==0 || layer==4) ui_layers[4].valid = 0;
+	if (layer==0 || layer==5) ui_layers[5].valid = 0;
 }
 
 void PLAT_drawOnLayer(SDL_Surface *inputSurface, int x, int y, int w, int h, float brightness, bool maintainAspectRatio,int layer) {
-    if (!inputSurface || !vid.target_layer1 || !vid.renderer) return;
+	if (!inputSurface) return;
 
-    SDL_Texture* tempTexture = SDL_CreateTexture(vid.renderer,
-                                                 SDL_PIXELFORMAT_ARGB8888,
-                                                 SDL_TEXTUREACCESS_TARGET,
-                                                 inputSurface->w, inputSurface->h);
-
-    if (!tempTexture) {
-        LOG_error("Failed to create temporary texture: %s\n", SDL_GetError());
-        return;
-    }
-
-    SDL_UpdateTexture(tempTexture, NULL, inputSurface->pixels, inputSurface->pitch);
-    switch (layer)
-	{
-	case 1:
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer1);
-		break;
-	case 2:
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer2);
-		break;
-	case 3:
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer3);
-		break;
-	case 4:
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer4);
-		break;
-	case 5:
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer5);
-		break;
-	default:
-		SDL_SetRenderTarget(vid.renderer, vid.target_layer1);
-		break;
+	SDL_Rect dstRect = { x, y, w, h };
+	if (maintainAspectRatio) {
+		float aspectRatio = (float)inputSurface->w / (float)inputSurface->h;
+		if (w / (float)h > aspectRatio) {
+			dstRect.w = (int)(h * aspectRatio);
+		} else {
+			dstRect.h = (int)(w / aspectRatio);
+		}
 	}
-
-    // Adjust brightness
-    Uint8 r = 255, g = 255, b = 255;
-    if (brightness < 1.0f) {
-        r = g = b = (Uint8)(255 * brightness);
-    } else if (brightness > 1.0f) {
-        r = g = b = 255;
-    }
-
-    SDL_SetTextureColorMod(tempTexture, r, g, b);
-
-    // Aspect ratio handling
-    SDL_Rect srcRect = { 0, 0, inputSurface->w, inputSurface->h };
-    SDL_Rect dstRect = { x, y, w, h };
-
-    if (maintainAspectRatio) {
-        float aspectRatio = (float)inputSurface->w / (float)inputSurface->h;
-
-        if (w / (float)h > aspectRatio) {
-            dstRect.w = (int)(h * aspectRatio);
-        } else {
-            dstRect.h = (int)(w / aspectRatio);
-        }
-    }
-
-    SDL_RenderCopy(vid.renderer, tempTexture, &srcRect, &dstRect);
-    SDL_SetRenderTarget(vid.renderer, NULL);
-    SDL_DestroyTexture(tempTexture);
+	ui_layer_upload(ui_layer_slot(layer), inputSurface,
+			dstRect.x, dstRect.y, dstRect.w, dstRect.h, brightness, 1.0f);
 }
 
-
-void PLAT_animateSurface(
-	SDL_Surface *inputSurface,
-	int x, int y,
-	int target_x, int target_y,
-	int w, int h,
-	int duration_ms,
-	int start_opacity,
-	int target_opacity,
-	int layer
-) {
-	if (!inputSurface || !vid.target_layer2 || !vid.renderer) return;
-
-	SDL_Texture* tempTexture = SDL_CreateTexture(vid.renderer,
-		SDL_PIXELFORMAT_ARGB8888,
-		SDL_TEXTUREACCESS_TARGET,
-		inputSurface->w, inputSurface->h);
-
-	if (!tempTexture) {
-		LOG_error("Failed to create temporary texture: %s\n", SDL_GetError());
-		return;
-	}
-
-	SDL_UpdateTexture(tempTexture, NULL, inputSurface->pixels, inputSurface->pitch);
-	SDL_SetTextureBlendMode(tempTexture, SDL_BLENDMODE_BLEND);  // Enable blending for opacity
-
-	const int fps = 60;
-	const int frame_delay = 1000 / fps;
-	const int total_frames = duration_ms / frame_delay;
-
-	for (int frame = 0; frame <= total_frames; ++frame) {
-
-		float t = (float)frame / total_frames;
-
-		int current_x = x + (int)((target_x - x) * t);
-		int current_y = y + (int)((target_y - y) * t);
-
-		// Interpolate opacity
-		int current_opacity = start_opacity + (int)((target_opacity - start_opacity) * t);
-		if (current_opacity < 0) current_opacity = 0;
-		if (current_opacity > 255) current_opacity = 255;
-
-		SDL_SetTextureAlphaMod(tempTexture, current_opacity);
-
-		if (layer == 0)
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer2);
-		else
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer4);
-
-		SDL_SetRenderDrawColor(vid.renderer, 0, 0, 0, 0);
-		SDL_RenderClear(vid.renderer);
-
-		SDL_Rect srcRect = { 0, 0, inputSurface->w, inputSurface->h };
-		SDL_Rect dstRect = { current_x, current_y, w, h };
-		SDL_RenderCopy(vid.renderer, tempTexture, &srcRect, &dstRect);
-
-		SDL_SetRenderTarget(vid.renderer, NULL);
-		PLAT_GPU_Flip();
-	}
-
-	SDL_DestroyTexture(tempTexture);
-}
 
 int PLAT_textShouldScroll(TTF_Font* font, const char* in_name,int max_width, SDL_mutex* fontMutex) {
     int text_width = 0;
@@ -1261,91 +1191,6 @@ static int text_offset = 0;
 void PLAT_resetScrollText() {
 	text_offset = 0;
 }
-void PLAT_scrollTextTexture(
-    TTF_Font* font,
-    const char* in_name,
-    int x, int y,      // Position on target layer
-    int w, int h,      // Clipping width and height
-    SDL_Color color,
-    float transparency,
-    SDL_mutex* fontMutex  // Mutex for thread-safe font access (can be NULL)
-) {
-    static int frame_counter = 0;
-	int padding = 30;
-
-    if (transparency < 0.0f) transparency = 0.0f;
-    if (transparency > 1.0f) transparency = 1.0f;
-    color.a = (Uint8)(transparency * 255);
-
-    // Render the original text with mutex protection for thread safety
-    if (fontMutex) SDL_LockMutex(fontMutex);
-    SDL_Surface* singleSur = TTF_RenderUTF8_Blended(font, in_name, color);
-    if (fontMutex) SDL_UnlockMutex(fontMutex);
-    if (!singleSur) return;
-
-    int single_width = singleSur->w;
-    int single_height = singleSur->h;
-
-    // Create a surface to hold two copies side by side with padding
-    SDL_Surface* text_surface = SDL_CreateRGBSurfaceWithFormat(0,
-        single_width * 2 + padding, single_height, 32, SDL_PIXELFORMAT_ARGB8888);
-
-    SDL_FillRect(text_surface, NULL, THEME_COLOR1);
-    SDL_BlitSurface(singleSur, NULL, text_surface, NULL);
-
-    SDL_Rect second = { single_width + padding, 0, single_width, single_height };
-    SDL_BlitSurface(singleSur, NULL, text_surface, &second);
-    SDL_FreeSurface(singleSur);
-
-    SDL_Texture* full_text_texture = SDL_CreateTextureFromSurface(vid.renderer, text_surface);
-    int full_text_width = text_surface->w;
-    SDL_FreeSurface(text_surface);
-
-    if (!full_text_texture) return;
-
-    SDL_SetTextureBlendMode(full_text_texture, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureAlphaMod(full_text_texture, color.a);
-
-    SDL_SetRenderTarget(vid.renderer, vid.target_layer4);
-
-    SDL_Rect src_rect = { text_offset, 0, w, single_height };
-    SDL_Rect dst_rect = { x, y, w, single_height };
-
-    SDL_RenderCopy(vid.renderer, full_text_texture, &src_rect, &dst_rect);
-
-    SDL_SetRenderTarget(vid.renderer, NULL);
-    SDL_DestroyTexture(full_text_texture);
-
-    // Scroll only if text is wider than clip width
-    if (single_width > w) {
-        frame_counter++;
-        if (frame_counter >= 0) {
-            text_offset += 2;
-            if (text_offset >= single_width + padding) {
-                text_offset = 0;
-            }
-            frame_counter = 0;
-        }
-    } else {
-        text_offset = 0;
-    }
-
-    PLAT_GPU_Flip();
-}
-
-
-// super fast without update_texture to draw screen
-void PLAT_GPU_Flip() {
-	SDL_RenderClear(vid.renderer);
-	SDL_RenderCopy(vid.renderer, vid.target_layer1, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer2, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.stream_layer1, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer3, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer4, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer5, NULL, NULL);
-	SDL_RenderPresent(vid.renderer);
-}
-
 void PLAT_animateSurfaceOpacity(
 	SDL_Surface *inputSurface,
 	int x, int y, int w, int h,
@@ -1355,29 +1200,15 @@ void PLAT_animateSurfaceOpacity(
 ) {
 	if (!inputSurface) return;
 
-	SDL_Texture* tempTexture = SDL_CreateTexture(vid.renderer,
-		SDL_PIXELFORMAT_ARGB8888,
-		SDL_TEXTUREACCESS_TARGET,
-		inputSurface->w, inputSurface->h);
-
-	if (!tempTexture) {
-		LOG_error("Failed to create temporary texture: %s\n", SDL_GetError());
-		return;
-	}
-
-	SDL_UpdateTexture(tempTexture, NULL, inputSurface->pixels, inputSurface->pitch);
-	SDL_SetTextureBlendMode(tempTexture, SDL_BLENDMODE_BLEND);
-
 	const int fps = 60;
 	const int frame_delay = 1000 / fps;
-	const int total_frames = duration_ms / frame_delay;
+	int total_frames = duration_ms / frame_delay;
+	if (total_frames < 1) total_frames = 1;
 
-	SDL_Texture* target_layer = (layer == 0) ? vid.target_layer2 : vid.target_layer4;
-	if (!target_layer) {
-		SDL_DestroyTexture(tempTexture);
-		return;
-	}
-
+	// GL path: re-upload the surface into the layer texture with the current
+	// opacity and present. Same layer mapping as upstream
+	// ((layer==0) ? layer2 : layer4).
+	int slot = (layer == 0) ? 2 : 4;
 	for (int frame = 0; frame <= total_frames; ++frame) {
 
 		float t = (float)frame / total_frames;
@@ -1385,169 +1216,12 @@ void PLAT_animateSurfaceOpacity(
 		if (current_opacity < 0) current_opacity = 0;
 		if (current_opacity > 255) current_opacity = 255;
 
-		SDL_SetTextureAlphaMod(tempTexture, current_opacity);
-		SDL_SetRenderTarget(vid.renderer, target_layer);
-		SDL_SetRenderDrawColor(vid.renderer, 0, 0, 0, 0);
-		SDL_RenderClear(vid.renderer);
-
-		SDL_Rect dstRect = { x, y, w, h };
-		SDL_RenderCopy(vid.renderer, tempTexture, NULL, &dstRect);
-
-		SDL_SetRenderTarget(vid.renderer, NULL);
-		// blit to 0 for normal draw
+		ui_layer_upload(slot, inputSurface, x, y, w, h, 1.0f,
+				(float)current_opacity / 255.0f);
 		vid.blit = 0;
 		PLAT_flip(vid.screen,0);
 
 	}
-
-	SDL_DestroyTexture(tempTexture);
-}
-
-SDL_Surface* PLAT_captureRendererToSurface() {
-	if (!vid.renderer) return NULL;
-
-	int width, height;
-	SDL_GetRendererOutputSize(vid.renderer, &width, &height);
-
-	SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
-	if (!surface) {
-		LOG_error("Failed to create surface: %s\n", SDL_GetError());
-		return NULL;
-	}
-
-	Uint32 black = SDL_MapRGBA(surface->format, 0, 0, 0, 255);
-	SDL_FillRect(surface, NULL, black);
-
-	if (SDL_RenderReadPixels(vid.renderer, NULL, SDL_PIXELFORMAT_ARGB8888, surface->pixels, surface->pitch) != 0) {
-		LOG_error("Failed to read pixels from renderer: %s\n", SDL_GetError());
-		SDL_FreeSurface(surface);
-		return NULL;
-	}
-
-	// remove transparancy
-	Uint32* pixels = (Uint32*)surface->pixels;
-	int total_pixels = (surface->pitch / 4) * surface->h;
-
-	for (int i = 0; i < total_pixels; i++) {
-		Uint8 r, g, b, a;
-		SDL_GetRGBA(pixels[i], surface->format, &r, &g, &b, &a);
-		pixels[i] = SDL_MapRGBA(surface->format, r, g, b, 255);
-	}
-
-	SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_NONE);
-	return surface;
-}
-
-static float anim_ease(float t, int easing, float intensity) {
-	switch (easing) {
-		case ANIM_EASE_OUT:
-			return 1.0f - powf(1.0f - t, intensity);
-		case ANIM_EASE_IN:
-			return powf(t, intensity);
-		case ANIM_EASE_IN_OUT:
-			return t < 0.5f
-				? 0.5f * powf(2.0f * t, intensity)
-				: 1.0f - 0.5f * powf(2.0f * (1.0f - t), intensity);
-		default:
-			return t;
-	}
-}
-
-void PLAT_animateAndFadeSurface(
-	SDL_Surface *inputSurface,
-	int x, int y, int target_x, int target_y, int w, int h, int duration_ms,
-	SDL_Surface *fadeSurface,
-	int fade_x, int fade_y, int fade_target_x, int fade_target_y, int fade_w, int fade_h,
-	int start_opacity, int target_opacity, int layer,
-	int input_easing, int fade_easing, int intensity
-) {
-	if (!inputSurface || !vid.renderer) return;
-
-	SDL_Texture* moveTexture = SDL_CreateTexture(vid.renderer,
-		SDL_PIXELFORMAT_ARGB8888,
-		SDL_TEXTUREACCESS_TARGET,
-		inputSurface->w, inputSurface->h);
-
-	if (!moveTexture) {
-		LOG_error("Failed to create move texture: %s\n", SDL_GetError());
-		return;
-	}
-
-	SDL_UpdateTexture(moveTexture, NULL, inputSurface->pixels, inputSurface->pitch);
-
-	SDL_Texture* fadeTexture = NULL;
-	if (fadeSurface) {
-		fadeTexture = SDL_CreateTextureFromSurface(vid.renderer, fadeSurface);
-		if (!fadeTexture) {
-			LOG_error("Failed to create fade texture: %s\n", SDL_GetError());
-			SDL_DestroyTexture(moveTexture);
-			return;
-		}
-		SDL_SetTextureBlendMode(fadeTexture, SDL_BLENDMODE_BLEND);
-	}
-
-	const int fps = 60;
-	const int frame_delay = 1000 / fps;
-	const int total_frames = duration_ms / frame_delay;
-
-	Uint32 start_time = SDL_GetTicks();
-
-	for (int frame = 0; frame <= total_frames; ++frame) {
-
-		float t = (float)frame / total_frames;
-		float t_input = anim_ease(t, input_easing, (float)intensity);
-		float t_fade  = anim_ease(t, fade_easing, (float)intensity);
-
-		int current_x = x + (int)((target_x - x) * t_input);
-		int current_y = y + (int)((target_y - y) * t_input);
-
-		int current_opacity = start_opacity + (int)((target_opacity - start_opacity) * t);
-		if (current_opacity < 0) current_opacity = 0;
-		if (current_opacity > 255) current_opacity = 255;
-
-		switch (layer)
-		{
-		case 1:
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer1);
-			break;
-		case 2:
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer2);
-			break;
-		case 3:
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer3);
-			break;
-		case 4:
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer4);
-			break;
-		case 5:
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer5);
-			break;
-		default:
-			SDL_SetRenderTarget(vid.renderer, vid.target_layer1);
-			break;
-		}
-		SDL_SetRenderDrawColor(vid.renderer, 0, 0, 0, 0);
-		SDL_RenderClear(vid.renderer);
-
-		SDL_Rect moveSrcRect = { 0, 0, inputSurface->w, inputSurface->h };
-		SDL_Rect moveDstRect = { current_x, current_y, w, h };
-		SDL_RenderCopy(vid.renderer, moveTexture, &moveSrcRect, &moveDstRect);
-
-		if (fadeTexture) {
-			SDL_SetTextureAlphaMod(fadeTexture, current_opacity);
-			int fade_current_x = fade_x + (int)((fade_target_x - fade_x) * t_fade);
-			int fade_current_y = fade_y + (int)((fade_target_y - fade_y) * t_fade);
-			SDL_Rect fadeDstRect = { fade_current_x, fade_current_y, fade_w, fade_h };
-			SDL_RenderCopy(vid.renderer, fadeTexture, NULL, &fadeDstRect);
-		}
-
-		SDL_SetRenderTarget(vid.renderer, NULL);
-		PLAT_GPU_Flip();
-
-	}
-
-	SDL_DestroyTexture(moveTexture);
-	if (fadeTexture) SDL_DestroyTexture(fadeTexture);
 }
 
 void PLAT_setEffect(int next_type) {
@@ -1565,50 +1239,10 @@ void PLAT_vsync(int remaining) {
 }
 
 
-void setRectToAspectRatio(SDL_Rect* dst_rect) {
-    int x = vid.blit->src_x;
-    int y = vid.blit->src_y;
-    int w = vid.blit->src_w;
-    int h = vid.blit->src_h;
-
-    if (vid.blit->aspect == 0) {
-        w = vid.blit->src_w * vid.blit->scale;
-        h = vid.blit->src_h * vid.blit->scale;
-        dst_rect->x = (device_width - w) / 2 + screenx;
-        dst_rect->y = (device_height - h) / 2 + screeny;
-        dst_rect->w = w;
-        dst_rect->h = h;
-    } else if (vid.blit->aspect > 0) {
-        if (should_rotate) {
-            h = device_width;
-            w = h * vid.blit->aspect;
-            if (w > device_height) {
-                w = device_height;
-                h = w / vid.blit->aspect;
-            }
-        } else {
-            h = device_height;
-            w = h * vid.blit->aspect;
-            if (w > device_width) {
-                w = device_width;
-                h = w / vid.blit->aspect;
-            }
-        }
-        dst_rect->x = (device_width - w) / 2 + screenx;
-        dst_rect->y = (device_height - h) / 2 + screeny;
-        dst_rect->w = w;
-        dst_rect->h = h;
-    } else {
-        dst_rect->x = screenx;
-        dst_rect->y = screeny;
-        dst_rect->w = should_rotate ? device_height : device_width;
-        dst_rect->h = should_rotate ? device_width : device_height;
-    }
-}
-
 void PLAT_blitRenderer(GFX_Renderer* renderer) {
+	// The software present path (PLAT_GL_Swap) reads vid.blit directly; there is
+	// no SDL renderer to clear any more.
 	vid.blit = renderer;
-	SDL_RenderClear(vid.renderer);
 	resizeVideo(vid.blit->true_w,vid.blit->true_h,vid.blit->src_p);
 }
 
@@ -1619,80 +1253,32 @@ void PLAT_clearShaders() {
 }
 
 void PLAT_flipHidden() {
-	SDL_RenderClear(vid.renderer);
-	resizeVideo(device_width, device_height, FIXED_PITCH); // !!!???
-	SDL_UpdateTexture(vid.stream_layer1, NULL, vid.screen->pixels, vid.screen->pitch);
-	SDL_RenderCopy(vid.renderer, vid.target_layer1, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer2, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.stream_layer1, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer3, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer4, NULL, NULL);
-	SDL_RenderCopy(vid.renderer, vid.target_layer5, NULL, NULL);
-	//  SDL_RenderPresent(vid.renderer); // no present want to flip  hidden
+	// "Composite without presenting": no caller in the tree, but keep the
+	// capability -- draw the same UI composite and skip the swap.
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	if (vid.screen)
+		ui_layer_upload(0, vid.screen, 0, 0, device_width, device_height, 1.0f, 1.0f);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, device_width, device_height);
+	ui_layer_draw(1);
+	ui_layer_draw(2);
+	ui_layer_draw(0);
+	ui_layer_draw(3);
+	ui_layer_draw(4);
+	ui_layer_draw(5);
 }
 
 
-void PLAT_flip(SDL_Surface* IGNORED, int ignored) {
-	// dont think we need this here tbh
-	// SDL_RenderClear(vid.renderer);
-	if (!vid.blit) {
-        resizeVideo(device_width, device_height, FIXED_PITCH); // !!!???
-        SDL_UpdateTexture(vid.stream_layer1, NULL, vid.screen->pixels, vid.screen->pitch);
-		SDL_RenderCopy(vid.renderer, vid.target_layer1, NULL, NULL);
-		SDL_RenderCopy(vid.renderer, vid.target_layer2, NULL, NULL);
-        SDL_RenderCopy(vid.renderer, vid.stream_layer1, NULL, NULL);
-		SDL_RenderCopy(vid.renderer, vid.target_layer3, NULL, NULL);
-		SDL_RenderCopy(vid.renderer, vid.target_layer4, NULL, NULL);
-		SDL_RenderCopy(vid.renderer, vid.target_layer5, NULL, NULL);
-        SDL_RenderPresent(vid.renderer);
-        return;
-    }
-
-    // Safety check: ensure texture dimensions match blit buffer dimensions
-    if (vid.width != vid.blit->true_w || vid.height != vid.blit->true_h) {
-        // Texture size doesn't match buffer, clear blit and use screen buffer instead
-        vid.blit = NULL;
-        resizeVideo(device_width, device_height, FIXED_PITCH);
-        SDL_UpdateTexture(vid.stream_layer1, NULL, vid.screen->pixels, vid.screen->pitch);
-        SDL_RenderCopy(vid.renderer, vid.target_layer1, NULL, NULL);
-        SDL_RenderCopy(vid.renderer, vid.target_layer2, NULL, NULL);
-        SDL_RenderCopy(vid.renderer, vid.stream_layer1, NULL, NULL);
-        SDL_RenderCopy(vid.renderer, vid.target_layer3, NULL, NULL);
-        SDL_RenderCopy(vid.renderer, vid.target_layer4, NULL, NULL);
-        SDL_RenderCopy(vid.renderer, vid.target_layer5, NULL, NULL);
-        SDL_RenderPresent(vid.renderer);
-        return;
-    }
-
-    SDL_UpdateTexture(vid.stream_layer1, NULL, vid.blit->src, vid.blit->src_p);
-
-    SDL_Texture* target = vid.stream_layer1;
-    int x = vid.blit->src_x;
-    int y = vid.blit->src_y;
-    int w = vid.blit->src_w;
-    int h = vid.blit->src_h;
-    if (vid.sharpness == SHARPNESS_CRISP) {
-
-        SDL_SetRenderTarget(vid.renderer, vid.target);
-        SDL_RenderCopy(vid.renderer, vid.stream_layer1, NULL, NULL);
-        SDL_SetRenderTarget(vid.renderer, NULL);
-        x *= hard_scale;
-        y *= hard_scale;
-        w *= hard_scale;
-        h *= hard_scale;
-        target = vid.target;
-    }
-
-    SDL_Rect* src_rect = &(SDL_Rect){x, y, w, h};
-    SDL_Rect* dst_rect = &(SDL_Rect){0, 0, device_width, device_height};
-
-    setRectToAspectRatio(dst_rect);
-
-    SDL_RenderCopy(vid.renderer, target, src_rect, dst_rect);
-
-    SDL_RenderPresent(vid.renderer);
-    vid.blit = NULL;
+void PLAT_flip(SDL_Surface* screen, int ignored) {
+	// ONE frontend present for every non-game frame (menus, in-game menu,
+	// transitions): composite the UI layers + the UI surface in the main GL
+	// context and swap. There is no second context, no SDL renderer and no
+	// post-swap window readback left in this path -- see the GL UI compositor
+	// above. Upstream used the SDL renderer here.
+	ui_present(screen ? screen : vid.screen);
+	vid.blit = NULL;
 }
+
 
 int frame_count = 0;   // extern in ma_chain.h (the chain uses it)
 static GLuint orig_texture = 0;
@@ -1808,6 +1394,64 @@ static int effect_w = 0, effect_h = 0;
 static GLuint overlay_tex = 0;
 static int overlay_w = 0, overlay_h = 0;
 
+// Debug HUD layer: one surface + one texture for BOTH present paths, filled by
+// the single rasterizer in ma_video.c (PLAT_draw_debug_hud -> drawDebugHud) and
+// composited by PLAT_composite_overlays below.  Half device resolution on a
+// fullscreen quad, so the text keeps upstream's apparent size.
+static uint32_t *dbg_hud_pixels = NULL;
+static int dbg_hud_w = 0, dbg_hud_h = 0;
+static GLuint dbg_hud_tex = 0;
+static int dbg_hud_tex_sized = 0;
+
+// Every RGBA overlay draw goes through s_pass_overlay, and runShaderPass reads
+// the pass's source size for the TextureSize/InputSize/TexelSize uniforms. Set
+// it from the texture actually being drawn right before each draw, so the pass
+// never carries another layer's numbers.
+static void overlay_pass_src(int w, int h) {
+	s_pass_overlay.srcw = s_pass_overlay.texw = w;
+	s_pass_overlay.srch = s_pass_overlay.texh = h;
+}
+
+static void update_debug_hud_texture(void) {
+	int w = device_width / 2, h = device_height / 2;
+	if (w <= 0 || h <= 0) return;
+	if (!dbg_hud_pixels || dbg_hud_w != w || dbg_hud_h != h) {
+		free(dbg_hud_pixels);
+		dbg_hud_pixels = calloc((size_t)w * (size_t)h, 4);
+		dbg_hud_w = w;
+		dbg_hud_h = h;
+		dbg_hud_tex_sized = 0;
+	}
+	if (!dbg_hud_pixels) return;
+
+	// Transparent background: the HUD's black text boxes and white glyphs are
+	// opaque, everything else blends through to the frame either path produced.
+	memset(dbg_hud_pixels, 0, (size_t)w * (size_t)h * 4);
+	PLAT_draw_debug_hud(dbg_hud_pixels, (unsigned)w, (unsigned)h,
+			(size_t)w * 4, RETRO_PIXEL_FORMAT_XRGB8888);
+
+	if (!dbg_hud_tex) {
+		glGenTextures(1, &dbg_hud_tex);
+		if (!dbg_hud_tex) return;
+	}
+	glBindTexture(GL_TEXTURE_2D, dbg_hud_tex);
+	PLAT_gl_unpack_reset();
+	if (!dbg_hud_tex_sized) {
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+				GL_UNSIGNED_BYTE, dbg_hud_pixels);
+		dbg_hud_tex_sized = 1;
+	} else {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA,
+				GL_UNSIGNED_BYTE, dbg_hud_pixels);
+	}
+}
+
+
+
 // The prep thread loads effect/overlay surfaces for BOTH present paths
 // (software PLAT_GL_Swap and the hw-render quad path); start it lazily
 // from whichever path first needs it.
@@ -1838,6 +1482,7 @@ static void update_effect_overlay_textures(void) {
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			PLAT_gl_unpack_reset();
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, loaded_effect->w, loaded_effect->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, loaded_effect->pixels);
 			effect_w = loaded_effect->w;
 			effect_h = loaded_effect->h;
@@ -1868,9 +1513,12 @@ static void update_effect_overlay_textures(void) {
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			PLAT_gl_unpack_reset();
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, loaded_overlay->w, loaded_overlay->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, loaded_overlay->pixels);
 			overlay_w = loaded_overlay->w;
 			overlay_h = loaded_overlay->h;
+			LOG_info("minarch: overlay texture %dx%d pitch=%d\n",
+					overlay_w, overlay_h, (int)loaded_overlay->pitch);
 			s_pass_overlay.srcw = s_pass_overlay.texw = overlay_w;
 			s_pass_overlay.srch = s_pass_overlay.texh = overlay_h;
 
@@ -1892,16 +1540,6 @@ void PLAT_prepare_overlay_textures(void) {
 	ensure_prepare_thread();
 	update_effect_overlay_textures();
 }
-unsigned int PLAT_effect_texture(int *w, int *h) {
-	if (w) *w = effect_w;
-	if (h) *h = effect_h;
-	return effect_tex;
-}
-unsigned int PLAT_overlay_texture(int *w, int *h) {
-	if (w) *w = overlay_w;
-	if (h) *h = overlay_h;
-	return overlay_tex;
-}
 // Effect PNG density selection (line-N.png / grid-N.png) follows the integer
 // scale of the presenter's rect (P3 removed the CPU scaler -- both present
 // paths derive it from their present rect now).
@@ -1914,6 +1552,108 @@ void PLAT_setEffectScale(int scale) {
 // GL context accessors for the libretro hardware-render (glsm) path
 SDL_Window* PLAT_getGLWindow(void) { return vid.window; }
 SDL_GLContext PLAT_getGLContext(void) { return vid.gl_context; }
+
+// The single overlay composite stage -- see the declaration in api.h.  This
+// used to exist twice: the software path inlined it here, while the hw-render
+// path carried its own program (ma_gl.c ma_gl_overlay_*) and silently never
+// drew notifications at all (PLAT_GL_Swap is a software-core path).  Both
+// present paths now run this one implementation, in the software path's
+// original order: game -> effect -> overlay -> notification.
+//
+// Everything here is RGBA with alpha, so each draw runs through the factory
+// overlay pass (s_pass_overlay, overlay.glsl) with blending on -- never the
+// present program, whose fragment shader forces alpha = 1 (RA modern_opaque)
+// and whose vertex shader applies the present MVP.
+void PLAT_composite_overlays(int effect_x, int effect_y, unsigned int pipeline_src) {
+	if (effect_tex) {
+		overlay_pass_src(effect_w, effect_h);
+		runShaderPass(
+			&s_pass_overlay, effect_tex, pipeline_src,
+			NULL,
+			GL_NONE,
+			effect_x, effect_y, effect_w, effect_h,
+			NULL, 0, 1);
+	}
+
+	if (overlay_tex) {
+		overlay_pass_src(overlay_w, overlay_h);
+		runShaderPass(
+			&s_pass_overlay, overlay_tex, pipeline_src,
+			NULL,
+			GL_NONE,
+			0, 0, device_width, device_height,
+			NULL, 0, 1);
+	}
+
+	// Notification overlay (RA achievements/indicators; the surface is
+	// published by Notification_renderToLayer through
+	// PLAT_setNotificationSurface).  Texture pre-allocated in
+	// PLAT_initNotificationTexture.
+	if (notif.dirty && notif.surface) {
+		glBindTexture(GL_TEXTURE_2D, notif.tex);
+		PLAT_gl_unpack_reset();
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, notif.surface->w, notif.surface->h, GL_RGBA, GL_UNSIGNED_BYTE, notif.surface->pixels);
+		notif.dirty = 0;
+	}
+
+	if (notif.tex && notif.surface) {
+		overlay_pass_src(notif.tex_w, notif.tex_h);
+		runShaderPass(
+			&s_pass_overlay, notif.tex, pipeline_src,
+			NULL,
+			GL_NONE,
+			notif.x, notif.y, notif.tex_w, notif.tex_h,
+			NULL, 0, 1);
+	}
+
+	// Debug HUD, last of the overlays (it is debug info: always on top).
+	// This is the one composition point for BOTH present paths: the game image
+	// from either path is already finished here (the software path calls this
+	// from sw_present_draw, the hw-render path from ma_gl_present_quad), so the
+	// HUD looks the same on both -- and because it is part of the draw that
+	// PLAT_GL_screenCapture replays, screenshots contain it too.
+	if (PLAT_debug_hud_active()) {
+		update_debug_hud_texture();
+		if (dbg_hud_tex) {
+			overlay_pass_src(dbg_hud_w, dbg_hud_h);
+			runShaderPass(
+				&s_pass_overlay, dbg_hud_tex, pipeline_src,
+				NULL,
+				GL_NONE,
+				0, 0, device_width, device_height,
+				NULL, 0, 1);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Software present, split into "what to draw" (replayable) and "present it".
+//
+// PLAT_GL_screenCapture needs the frame that was presented, and the only
+// well-defined way to get it is to draw it again -- exactly what RA does by
+// reading its viewport BEFORE the swap (gl3_read_viewport). Reading the window
+// after SDL_GL_SwapWindow is undefined by spec; it happens to work on this
+// driver, which is precisely the kind of reliance this removes.
+// ---------------------------------------------------------------------------
+static GLuint sw_present_tex = 0;
+static int sw_present_w = 0, sw_present_h = 0;
+static int sw_present_dx = 0, sw_present_dy = 0, sw_present_dw = 0, sw_present_dh = 0;
+
+static void sw_present_draw(void) {
+	if (!sw_present_tex || sw_present_w <= 0 || sw_present_h <= 0) return;
+	PLAT_run_shader_pipeline(sw_present_tex, sw_present_tex,
+			sw_present_w, sw_present_h, 0,
+			sw_present_dx, sw_present_dy, sw_present_dw, sw_present_dh,
+			(float)sw_present_w, (float)sw_present_h, 0, 1);
+
+	if (effect_tex || overlay_tex || notif.tex || PLAT_debug_hud_active()) {
+		// Game draw is done; composite the overlays through the ONE shared
+		// stage (also used by the hw-render present in ma_gl.c). The debug HUD
+		// lives in that stage too, so it must be able to run even when no
+		// effect/overlay/notification texture exists.
+		PLAT_composite_overlays(sw_present_dx, sw_present_dy, sw_present_tex);
+	}
+}
 
 void PLAT_GL_Swap() {
 
@@ -1940,10 +1680,10 @@ void PLAT_GL_Swap() {
 	dst_x += screenx;
 	dst_y += screeny;
 
-	// Keep the renderer's rect + integer scale meaningful (software debug
-	// HUD, and the SDL message path's setRectToAspectRatio). The integer
-	// scale of the present rect also feeds the Screen Effect density (the
-	// deleted CPU scaler used to be what supplied that scale).
+	// Keep the frame description in sync with the rect this present uses (the
+	// capture replay reads the rect back through sw_present_dx/dy/dw/dh) and
+	// derive the integer scale that feeds the Screen Effect density -- the
+	// deleted CPU scaler used to be what supplied that scale.
 	vid.blit->dst_x = dst_x;
 	vid.blit->dst_y = dst_y;
 	vid.blit->dst_w = dst_w;
@@ -2034,51 +1774,18 @@ void PLAT_GL_Swap() {
     last_w = vid.blit->src_w;
     last_h = vid.blit->src_h;
 
+	// Retain this present's description so PLAT_GL_screenCapture can replay the
+	// exact same draw into an offscreen target (RA reads its viewport before
+	// the swap; a post-swap window read is undefined).
+	sw_present_tex = orig_texture;
+	sw_present_w = last_w;  sw_present_h = last_h;
+	sw_present_dx = dst_rect.x; sw_present_dy = dst_rect.y;
+	sw_present_dw = dst_rect.w; sw_present_dh = dst_rect.h;
+
 	// Software cores: NextUI conventions -- exact-size pass textures, the
 	// Source/Texture Type numbers, clip-space quads + identity MVP and the
 	// stock system shaders (see AGENTS.md「呈现/shader 链架构」).
-	PLAT_run_shader_pipeline(orig_texture, orig_texture,
-			last_w, last_h, 0,
-			dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h,
-			(float)last_w, (float)last_h, 0, 1);
-
-    if (effect_tex) {
-		//LOG_info("Shader Pass: Screen Effect\n");
-        runShaderPass(
-			&s_pass_overlay, effect_tex, orig_texture,
-			NULL,
-			GL_NONE,
-			dst_rect.x, dst_rect.y, effect_w, effect_h,
-			NULL, 0, 1);
-    }
-
-    if (overlay_tex) {
-		//LOG_info("Shader Pass: Overlay\n");
-        runShaderPass(
-			&s_pass_overlay, overlay_tex, orig_texture,
-			NULL,
-			GL_NONE,
-            0, 0, device_width, device_height,
-			NULL, 0, 1);
-    }
-
-    // Render notification overlay if present (texture pre-allocated in PLAT_initShaders)
-    if (notif.dirty && notif.surface) {
-		glBindTexture(GL_TEXTURE_2D, notif.tex);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, notif.surface->w, notif.surface->h, GL_RGBA, GL_UNSIGNED_BYTE, notif.surface->pixels);
-		s_pass_notif.srcw = s_pass_notif.texw = notif.tex_w;
-		s_pass_notif.srch = s_pass_notif.texh = notif.tex_h;
-		notif.dirty = 0;
-    }
-
-    if (notif.tex && notif.surface) {
-		runShaderPass(
-			&s_pass_overlay, notif.tex, orig_texture,
-			NULL,
-			GL_NONE,
-			notif.x, notif.y, notif.tex_w, notif.tex_h,
-			NULL, 0, 1);
-    }
+	sw_present_draw();
 	// The debug HUD is minarch's original one and is stamped into the core
 	// frame in ma_video.c (upstream call site), so it is already part of the
 	// texture this function just presented -- nothing to composite here.
@@ -2129,22 +1836,72 @@ void PLAT_pixelFlipper(uint8_t* pixels, int width, int height) {
 }
 
 unsigned char* PLAT_GL_screenCapture(int* outWidth, int* outHeight) {
-    glViewport(0, 0, device_width, device_height);
-    GLint viewport[4];
-    glGetIntegerv(GL_VIEWPORT, viewport);
+	// Capture the frame that was PRESENTED, deterministically: replay the last
+	// present draw into an offscreen device-sized texture and read that back.
+	//
+	// RA reads its viewport before the swap for exactly this reason
+	// (gl3_read_viewport). The previous implementation read the window
+	// backbuffer AFTER SDL_GL_SwapWindow, whose contents are undefined by
+	// spec -- it happens to work on libmali, which is a reliance, not a
+	// contract. The replay goes through the same draw the present used
+	// (shader chain + effect/overlay/notification composite), so the capture
+	// is byte-identical to what was on screen.
+	static GLuint cap_tex = 0, cap_fbo = 0;
+	int width = device_width, height = device_height;
 
-    int width = viewport[2];
-    int height = viewport[3];
+	if (outWidth) *outWidth = width;
+	if (outHeight) *outHeight = height;
+	if (width <= 0 || height <= 0) return NULL;
 
-    if (outWidth) *outWidth = width;
-    if (outHeight) *outHeight = height;
+	unsigned char* pixels = malloc((size_t)width * height * 4); // RGBA
+	if (!pixels) return NULL;
 
-    unsigned char* pixels = malloc(width * height * 4); // RGBA
-    if (!pixels) return NULL;
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	if (!cap_tex) {
+		glGenTextures(1, &cap_tex);
+		glBindTexture(GL_TEXTURE_2D, cap_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+				GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glGenFramebuffers(1, &cap_fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, cap_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				GL_TEXTURE_2D, cap_tex, 0);
+		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			LOG_error("minarch: capture FBO incomplete\n");
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glDeleteFramebuffers(1, &cap_fbo); cap_fbo = 0;
+			glDeleteTextures(1, &cap_tex); cap_tex = 0;
+			free(pixels);
+			return NULL;
+		}
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, cap_fbo);
+	glViewport(0, 0, width, height);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_BLEND);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	PLAT_chain_set_present_target(cap_fbo);
+	if (MA_GL_is_active()) MA_GL_present_draw();
+	else                  sw_present_draw();
+	PLAT_chain_set_present_target(0);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, cap_fbo);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 	PLAT_pixelFlipper(pixels, width, height);
 
-    return pixels; // caller must free
+	return pixels; // caller must free
 }

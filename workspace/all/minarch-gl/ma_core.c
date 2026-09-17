@@ -17,6 +17,24 @@ void Core_getName(char* in_name, char* out_name) {
 	char* tmp = strrchr(out_name, '_');
 	tmp[0] = '\0';
 }
+
+// The core's retro_set_input_poll callback. RA's equivalent (poll_cb =
+// input_driver_poll, runloop.c:8731) is a bare, idempotent driver read that the
+// frontend may invoke from several places per frame; minarch's
+// input_poll_callback is NOT idempotent -- it runs PAD_poll *and* the whole
+// shortcut/menu stage (ma_input.c:17-219). So the frame must contain exactly
+// one poll:
+//   - override 0 (every other core): the core polls, as it always has.
+//   - override EARLY/LATE (flycast and mupen64plus-next announce it whenever
+//     their threaded renderer is on): the main loop polls before/after
+//     retro_run (RA core_run:9116-9117 / 9157-9159) and this callback is a
+//     no-op, even though flycast calls poll_cb() anyway
+//     (shell/libretro/libretro.cpp:1078).
+void core_input_poll_callback(void) {
+	if (input_poll_type_override == 0)
+		input_poll_callback();
+}
+
 void Core_open(const char* core_path, const char* tag_name) {
 	LOG_info("Core_open\n");
 	core.handle = dlopen(core_path, RTLD_LAZY);
@@ -86,7 +104,7 @@ void Core_open(const char* core_path, const char* tag_name) {
 	set_video_refresh_callback(video_refresh_callback);
 	set_audio_sample_callback(audio_sample_callback);
 	set_audio_sample_batch_callback(audio_sample_batch_callback);
-	set_input_poll_callback(input_poll_callback);
+	set_input_poll_callback(core_input_poll_callback);
 	set_input_state_callback(input_state_callback);
 }
 void Core_init(void) {
@@ -119,13 +137,16 @@ int Core_updateAVInfo(void) {
 	if (a<=0) a = (double)av_info.geometry.base_width / av_info.geometry.base_height;
 
 	int changed = (core.fps != av_info.timing.fps || core.sample_rate != av_info.timing.sample_rate || core.aspect_ratio != a
-		|| core.max_width != av_info.geometry.max_width || core.max_height != av_info.geometry.max_height);
+		|| core.max_width != av_info.geometry.max_width || core.max_height != av_info.geometry.max_height
+		|| core.base_width != av_info.geometry.base_width || core.base_height != av_info.geometry.base_height);
 
 	core.fps = av_info.timing.fps;
 	core.sample_rate = av_info.timing.sample_rate;
 	core.aspect_ratio = a;
 	core.max_width = av_info.geometry.max_width;
 	core.max_height = av_info.geometry.max_height;
+	core.base_width = av_info.geometry.base_width;
+	core.base_height = av_info.geometry.base_height;
 
 	if (changed) LOG_info("aspect_ratio: %f (%ix%i) fps: %f, max %ux%u\n", a, av_info.geometry.base_width,av_info.geometry.base_height, core.fps,
 		av_info.geometry.max_width, av_info.geometry.max_height);
@@ -154,6 +175,27 @@ void Core_load(void) {
 	// NOTE: must be called after core.load_game!
 	core.set_controller_port_device(0, RETRO_DEVICE_JOYPAD); // set a default, may update after loading configs
 	Core_updateAVInfo();
+
+	// RA contract: the core's context_reset runs once per GL context, after
+	// retro_load_game has returned -- RA calls it from drivers_init() right
+	// after video_driver_init_internal() (retroarch.c:1647-1648), and
+	// drivers_init is not reachable from inside retro_load_game. Both GLES
+	// cores negotiate hw render *inside* load_game (flycast:
+	// set_opengl_hw_render; mupen64plus_next: glsm_state_ctx_init ->
+	// SET_HW_RENDER), so the reset has to be issued from here:
+	//   - mupen64plus_next defers plugin_connect_all() to the first
+	//     context_reset after load_game (libretro.c:135 first_context_reset,
+	//     reinit_gfx_plugin at :516-520); without it `gfx` stays zeroed and
+	//     main_run calls gfx.romOpen() through a NULL pointer (pc=0);
+	//   - flycast's renderer is (re)built by its context_reset callback
+	//     (libretro.cpp:1154-1163), which is where glsm caches the frontend
+	//     FBO (glsm.c:2759).
+	// Exactly one reset: a second one inside the same context makes mupen's
+	// glsm take its window-change path (glsm.c:3365-3375) and crash before
+	// RomOpen; see the comment in MA_GL_set_hw_render().
+	// No-op for software cores (MA_GL_context_reset returns early when no
+	// hw-render context was negotiated).
+	MA_GL_context_reset();
 }
 void Core_reset(void) {
 	core.reset();

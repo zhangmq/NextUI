@@ -36,6 +36,10 @@ struct Core {
 	// video_driver.c:4602 max_dim = MAX(max_width, max_height)).
 	unsigned max_width;
 	unsigned max_height;
+	// av_info.geometry base dimensions: RA video_driver_get_core_aspect
+	// fallback (video_driver.c:2574-2577) and the integer-scale content base.
+	unsigned base_width;
+	unsigned base_height;
 
 	void* handle;
 	void (*init)(void);
@@ -92,6 +96,10 @@ extern SDL_Surface *screen;
 
 extern int quit;
 extern int show_menu;
+/* RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE from the core (RA enum poll_type:
+ * 0 = don't care, 1 = EARLY, 2 = LATE). Set in ma_environment.c, consumed by
+ * the main loop in minarch.c. */
+extern int input_poll_type_override;
 extern int newScreenshot;
 extern int fast_forward;
 extern int rewinding;

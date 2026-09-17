@@ -320,19 +320,13 @@ SDL_Surface* GFX_init(int mode);
 #define GFX_shaders_active PLAT_shaders_active // (void) - chain configured?
 #define GFX_first_shader_filter PLAT_first_shader_filter // (void) - pass0 src filter, 0 if none
 #define GFX_prepare_overlay_textures PLAT_prepare_overlay_textures // (void)
-#define GFX_effect_texture PLAT_effect_texture // (int *w, int *h)
-#define GFX_overlay_texture PLAT_overlay_texture // (int *w, int *h)
 #define GFX_setOffsetX PLAT_setOffsetX// (int effect)
 #define GFX_setOffsetY PLAT_setOffsetY// (int effect)
 #define GFX_drawOnLayer PLAT_drawOnLayer //(SDL_Surface *inputSurface,int x, int y)
 #define GFX_clearLayers PLAT_clearLayers //(SDL_Surface *inputSurface,int x, int y)
-#define GFX_captureRendererToSurface PLAT_captureRendererToSurface //(void)
-#define GFX_animateSurface PLAT_animateSurface //(SDL_Surface *inputSurface,int x, int y)
 #define GFX_animateSurfaceOpacity PLAT_animateSurfaceOpacity //(SDL_Surface *inputSurface,int x, int y)
-#define GFX_animateAndFadeSurface PLAT_animateAndFadeSurface //(SDL_Surface *inputSurface,int x, int y)
 #define GFX_textShouldScroll PLAT_textShouldScroll // (TTF_Font* font, const char* in_name,int max_width, SDL_mutex* fontMutex);
 #define GFX_resetScrollText PLAT_resetScrollText // (void);
-#define GFX_scrollTextTexture PLAT_scrollTextTexture // (TTF_Font* font, const char* in_name,int x, int y, int w, int h, SDL_Color color, float transparency, SDL_mutex* fontMutex);
 #define GFX_flipHidden PLAT_flipHidden //(void)
 #define GFX_GL_screenCapture PLAT_GL_screenCapture //(void)
 #define GFX_setClearColor PLAT_setClearColor //(uint32_t color)
@@ -714,6 +708,9 @@ void PLAT_diag_capture(const char *tag);
 // rasterizes the same function onto a frontend surface and composites it.
 void GFX_frame_stats_display_only(double target_fps);
 void PLAT_draw_debug_hud(const void* data, unsigned width, unsigned height, size_t pitch, enum retro_pixel_format fmt);
+/* True while the debug HUD must be composited (show_debug + 5s warm-up). Read
+ * by the shared overlay stage so it can skip the layer entirely. */
+int PLAT_debug_hud_active(void);
 
 // P4: RetroArch .glslp preset -> minarch preset key/value text (glslp.c).
 // Defined in glslp.c; self-contained so it can be unit-tested on the host.
@@ -724,54 +721,31 @@ void PLAT_compute_present_rect(int width, int height,
 int PLAT_shaders_active(void);
 int PLAT_first_shader_filter(void);
 void PLAT_prepare_overlay_textures(void);
-unsigned int PLAT_effect_texture(int *w, int *h);
-unsigned int PLAT_overlay_texture(int *w, int *h);
+// The single overlay composite stage, shared by BOTH present paths (software:
+// PLAT_GL_Swap, hardware: ma_gl_present_quad) and by nothing else. Draws the
+// Screen Effect (anchored at the game rect, its own size), the Overlay and the
+// Notification through one pass program (s_pass_overlay = factory
+// overlay.glsl), in that order, over whatever the game draw left on the
+// default framebuffer. effect_x/effect_y = present-rect origin;
+// pipeline_src = the chain's source texture (OrigTexture uniform).
+void PLAT_composite_overlays(int effect_x, int effect_y, unsigned int pipeline_src);
 void PLAT_setOffsetX(int x);
 void PLAT_setOffsetY(int y);
 void PLAT_drawOnLayer(SDL_Surface *inputSurface, int x, int y, int w, int h, float brightness, bool maintainAspectRatio,int layer);
 void PLAT_clearLayers(int layer);
-SDL_Surface* PLAT_captureRendererToSurface();
 
 // Notification overlay for GL rendering (rendered on top of game during PLAT_GL_Swap)
 void PLAT_setNotificationSurface(SDL_Surface* surface, int x, int y);
 void PLAT_clearNotificationSurface(void);
 
-void PLAT_animateSurface(
-	SDL_Surface *inputSurface,
-	int x, int y,
-	int target_x, int target_y,
-	int w, int h,
-	int duration_ms,
-	int start_opacity,
-	int target_opacity,
-	int layer
-);
 #define ANIM_LINEAR      0
 #define ANIM_EASE_OUT    1  // fast start, slows to stop
 #define ANIM_EASE_IN     2  // slow start, fast exit
 #define ANIM_EASE_IN_OUT 3  // slow start, fast middle, slow end
 
-void PLAT_animateAndFadeSurface(
-	SDL_Surface *inputSurface,
-	int x, int y, int target_x, int target_y, int w, int h, int duration_ms,
-	SDL_Surface *fadeSurface,
-	int fade_x, int fade_y, int fade_target_x, int fade_target_y, int fade_w, int fade_h,
-	int start_opacity, int target_opacity, int layer,
-	int input_easing, int fade_easing, int intensity
-);
-
 void PLAT_animateSurfaceOpacity(SDL_Surface *inputSurface, int x, int y, int w, int h,
 	int start_opacity, int target_opacity, int duration_ms, int layer);
 
-void PLAT_scrollTextTexture(
-    TTF_Font* font,
-    const char* in_name,
-    int x, int y,      // Position on target layer
-    int w, int h,      // Clipping width and height
-    SDL_Color color,
-    float transparency,
-    SDL_mutex* fontMutex  // Mutex for thread-safe font access (can be NULL)
-);
 void PLAT_vsync(int remaining);
 void PLAT_blitRenderer(GFX_Renderer* renderer);
 void PLAT_flip(SDL_Surface* screen, int sync);
@@ -782,7 +756,6 @@ SDL_Window* PLAT_getGLWindow(void);
 SDL_GLContext PLAT_getGLContext(void);
 unsigned char* PLAT_GL_screenCapture(int* outWidth, int* outHeight);
 void PLAT_setClearColor(uint32_t color);
-void PLAT_GPU_Flip();
 void PLAT_setShaders(int nr);
 void PLAT_resetShaders();
 void PLAT_clearShaders();

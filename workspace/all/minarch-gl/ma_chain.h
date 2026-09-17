@@ -35,7 +35,8 @@ typedef struct ShaderProgram {
 typedef struct ShaderPass {
 	ShaderProgram * program;
 	int filter;
-	int alpha;
+	int alpha;      // 1 = blending on (src over dst), 0 = opaque overwrite
+	int premult;    // with alpha==1: source RGB is premultiplied (GL_ONE)
 	GLuint target_texture;
 	int target_updated;
 	int target_w;  // allocated pow2 dims of target_texture (RA fbo_rect w/h)
@@ -58,6 +59,9 @@ extern ShaderPass shaders[MAXSHADERS];
 extern const ShaderProgram blank_shader_program;
 extern const ShaderPass blank_shader_pass;
 extern ShaderPass s_pass_finalscale, s_pass_effect, s_pass_overlay, s_pass_notif;
+// Frontend UI surfaces (menu screen, UI layers): premultiplied alpha, same
+// factory overlay pass as the effect/overlay/notification composite.
+extern ShaderPass s_pass_ui;
 extern ShaderPass s_noshader_pass;
 extern int nrofshaders;
 extern int reloadShaderTextures;
@@ -72,5 +76,17 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 				   GLuint orig_texture_src, GLuint * target_texture, int next_filter,
                    int x, int y, int dst_width, int dst_height,
 				   const float mvp[16], int unit_quad, int exact_fbo);
+
+// Reset GL_UNPACK_ROW_LENGTH/ALIGNMENT before a frontend CPU texture upload:
+// the core owns those globals while it runs and glsm does not reset them.
+void PLAT_gl_unpack_reset(void);
+
+// Offscreen target for the pipeline's FINAL pass and for the overlay composite
+// when the pass has no target texture of its own (0 = the default framebuffer).
+// The present-capture path (PLAT_GL_screenCapture) sets this so the exact same
+// present draw is replayed into a texture: the captured pixels are then what
+// was presented, instead of an undefined post-swap window readback.
+void PLAT_chain_set_present_target(GLuint fbo);
+GLuint PLAT_chain_present_target(void);
 
 #endif

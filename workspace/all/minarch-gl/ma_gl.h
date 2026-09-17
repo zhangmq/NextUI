@@ -43,6 +43,11 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 // why the swap does not live in the video callback.
 void MA_GL_present_from_loop(void);
 
+// Re-draw the last presented hw-render frame (game + chain + overlays) into the
+// currently bound framebuffer. Used by PLAT_GL_screenCapture to capture the
+// presented frame deterministically instead of reading the post-swap window.
+void MA_GL_present_draw(void);
+
 // Take (and reset) the hardware-path present counters: new vs dupe frames and
 // the cost of our own draw.  See the definitions in ma_gl.c.
 void MA_GL_take_present_stats(unsigned* new_frames, unsigned* dupes,
@@ -60,9 +65,10 @@ void MA_GL_take_present_stats(unsigned* new_frames, unsigned* dupes,
 void MA_GL_set_rotation(unsigned rotation);
 
 // Re-make the hw-render GL context current (no-op when no GLES hw-render
-// core is active). Call after any frontend activity that may have switched
-// to another GL context (e.g. the SDL_Renderer used by the in-game menu)
-// so the next retro_run executes the core's GL work in the right context.
+// core is active). Call after frontend UI activity (Menu_loop) so the next
+// retro_run executes the core's GL work with this frontend's one context
+// current -- the cores cache GL object wrappers, so a wrong-current bind
+// renders into phantom objects. See the definition for the full rationale.
 void MA_GL_make_current(void);
 
 // RA semantics (SET_SYSTEM_AV_INFO): the hw-render FBO size follows the

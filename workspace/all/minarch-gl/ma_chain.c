@@ -49,6 +49,15 @@ ShaderPass s_pass_notif = { .program = &s_shader_overlay,
 	.alpha = 1, .target_texture = 0, .target_updated = 1
 };
 
+// Frontend UI (menu) surfaces: the menu draws with straight-alpha SDL blits
+// onto a transparent surface, so the composited pixels are PREMULTIPLIED
+// (dst = src.rgb*src.a over nothing). The SDL renderer presented them with a
+// premultiplied blend mode for the same reason; this pass keeps that exact
+// semantics while drawing through the shared GL overlay program.
+ShaderPass s_pass_ui = { .program = &s_shader_overlay,
+	.alpha = 1, .premult = 1, .target_texture = 0, .target_updated = 1
+};
+
 
 int nrofshaders = 0; // choose between 1 and 3 pipelines, > pipelines = more cpu usage, but more shader options and shader upscaling stuff
 // No-flip passthrough pass for the hw-render pipeline's final scale (the
@@ -107,6 +116,32 @@ void PLAT_compute_present_mvp(int rotation, float out[16]) {
 	}
 }
 
+// GL pixel-store state for FRONTEND CPU uploads (overlay/effect/notification
+// PNGs, the hw-render debug HUD surface).
+//
+// The frontend uploads its RGBA surfaces with glTexImage2D/glTexSubImage2D from
+// a tightly packed buffer, but the unpack state is GLOBAL GL state and the core
+// owns it while it runs: glsm/GLideN64 set GL_UNPACK_ROW_LENGTH for their own
+// texture streams and glsm's per-frame STATE_BIND does not reset it (it resets
+// program/FBO/viewport/texture/attribs only). A leftover row length makes the
+// frontend's upload read each row with the wrong stride, so the image arrives
+// skewed -- observed on the N64 hw path as a 1024x768 overlay PNG appearing as
+// two vertical bands instead of four quadrants.
+//
+// RA never relies on residual unpack state either: it sets GL_UNPACK_ROW_LENGTH
+// per upload from the real pitch (gl3.c:4134-4152, gl2.c:2547/2603). Ours are
+// tightly packed, so row length 0 (the default) is the correct value.
+void PLAT_gl_unpack_reset(void) {
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+}
+
+// See ma_chain.h. Static, module-private state: the present draw consults it
+// every time it would otherwise bind the default framebuffer.
+static GLuint s_present_target_fbo = 0;
+void PLAT_chain_set_present_target(GLuint fbo) { s_present_target_fbo = fbo; }
+GLuint PLAT_chain_present_target(void) { return s_present_target_fbo; }
+
 // RA chain-pass projection: mvp_no_rot (gl2.c:1482-1488) —
 // matrix_4x4_ortho(0,1,0,1,-1,1), column-major.
 static const float gl_chain_mvp[16] = {
@@ -130,7 +165,6 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	static GLuint static_VBO = 0;
 	static GLint pass_enabled_locs[8] = { 0 };
 	static int pass_enabled_cnt = 0;
-	static GLuint last_program = 0;
 	static GLfloat texelSize[2] = {-1.0f, -1.0f};
 	static GLuint fbo = 0;
 	static GLint max_tex_size = 0;
@@ -172,7 +206,6 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 			glDisableVertexAttribArray(pass_enabled_locs[e]);
 		pass_enabled_cnt = 0;
 		if (static_VBO) { glDeleteBuffers(1, &static_VBO); static_VBO = 0; }
-		last_program = 0;
 		texelSize[0] = texelSize[1] = -1.0f;
 		fbo = 0;
 	}
@@ -201,16 +234,33 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	texelSize[0] = 1.0f / shader_pass->texw;
 	texelSize[1] = 1.0f / shader_pass->texh;
 
-	if (shader_program_handle != last_program) {
-		// RA gl_glsl_use (shader_glsl.c:1802-1814): before switching
-		// programs, disable the attrib arrays the previous program enabled
-		// (gl_glsl_reset_attrib). Leftover enabled arrays with pointers into
-		// this pipeline's VBO would otherwise be read by later draws that
-		// bind the same VAO 0 / global attrib slots.
-		for (int e = 0; e < pass_enabled_cnt; e++)
-			glDisableVertexAttribArray(pass_enabled_locs[e]);
-		pass_enabled_cnt = 0;
-		glUseProgram(shader_program_handle);
+	// The program must be re-established from the ACTUAL GL binding, never from
+	// a module-local cache. This pipeline does not own the context exclusively:
+	// ma_gl.c binds its own present program around the chain
+	// (ma_gl_present_quad re-binds ma_gl_present_prog before compositing the
+	// overlays, and ma_gl_normalize_source binds it for the normalize quad), and
+	// the hw-render debug HUD / overlay draws go through this same function.
+	// A cached `last_program` therefore goes stale, and the overlay then runs
+	// under the PRESENT program -- whose fragment shader forces alpha = 1 and
+	// whose vertex shader applies the present MVP -- so the overlay is drawn at
+	// the wrong scale/position with its transparency lost. Exactly the failure
+	// mode AGENTS.md records for residual GL state.
+	// Other per-pass cached state (texelSize, fbo) does not depend on foreign
+	// bindings, but the program does; querying it costs one glGetIntegerv.
+	{
+		GLint current_program = 0;
+		glGetIntegerv(GL_CURRENT_PROGRAM, &current_program);
+		if ((GLuint)current_program != shader_program_handle) {
+			// RA gl_glsl_use (shader_glsl.c:1802-1814): before switching
+			// programs, disable the attrib arrays the previous program enabled
+			// (gl_glsl_reset_attrib). Leftover enabled arrays with pointers into
+			// this pipeline's VBO would otherwise be read by later draws that
+			// bind the same VAO 0 / global attrib slots.
+			for (int e = 0; e < pass_enabled_cnt; e++)
+				glDisableVertexAttribArray(pass_enabled_locs[e]);
+			pass_enabled_cnt = 0;
+			glUseProgram(shader_program_handle);
+		}
 	}
 
 	// RA gl_glsl_set_coords/set_attribs (shader_glsl.c:1709-1800, 701-731):
@@ -376,12 +426,18 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 		glClear(GL_COLOR_BUFFER_BIT);
 
     } else {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // No pass target of its own (final present pass, effect/overlay/UI
+        // composite): the default framebuffer, or the offscreen capture target
+        // while PLAT_GL_screenCapture replays the present.
+        glBindFramebuffer(GL_FRAMEBUFFER, PLAT_chain_present_target());
     }
 
 	if(shader_pass->alpha==1) {
 		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		// premult: source RGB already carries its alpha (frontend UI surfaces,
+		// the SDL-renderer texture blend modes did the same).
+		glBlendFunc(shader_pass->premult ? GL_ONE : GL_SRC_ALPHA,
+				GL_ONE_MINUS_SRC_ALPHA);
 	} else {
 		glDisable(GL_BLEND);
 	}
@@ -407,7 +463,6 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 		glUniform2fv(shader_program->u_texelSize, 1, texelSize);
 	}
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	last_program = shader_program_handle;
 }
 
 // Run the configured shader chain (0..MAXSHADERS passes) followed by the

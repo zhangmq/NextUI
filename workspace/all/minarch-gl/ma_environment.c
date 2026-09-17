@@ -8,6 +8,12 @@
 #include "ra_integration.h"
 #include "ma_environment.h"
 
+// RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE, in RetroArch's enum poll_type values
+// (DONTCARE 0 / EARLY 1 / LATE 2). 0 = the core polls itself through our
+// poll_cb (every other core); see the handler for why a non-zero value must
+// change the main loop, not just the return value.
+int input_poll_type_override = 0;
+
 static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uint16_t strength) {
 	// TODO: handle other args? not sure I can
 	VIB_setStrength(strength);
@@ -27,9 +33,20 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 		break;
 	}
 	case RETRO_ENVIRONMENT_GET_OVERSCAN: { /* 2 */
+		// RA default: runloop.c:1475 answers !video_crop_overscan and
+		// config.def.h:1094 defaults DEFAULT_CROP_OVERSCAN to true, i.e. the
+		// core is told to crop overscan away. minarch inherited a hardcoded
+		// `true` verbatim from picoarch (the whole switch is "copied from
+		// picoarch initially") with no documented rationale; see
+		// workspace/tmp/ra-viewport/OVERSCAN-INVESTIGATION.md.
+		// Measured 2026-09-17: none of the cores shipped on the device calls
+		// this env at all (snes9x, fceumm, pcsx_rearmed, picodrive, mgba,
+		// fbneo, mupen64plus_next, flycast), so this answer is a no-op today
+		// and only defines the contract for cores that do honour it (libretro
+		// deprecated the call in 2019: libretro.h:753-755).
 		bool *out = (bool *)data;
 		if (out)
-			*out = true;
+			*out = false;
 		break;
 	}
 	case RETRO_ENVIRONMENT_GET_CAN_DUPE: { /* 3 */
@@ -178,6 +195,8 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 			core.aspect_ratio = a;
 			core.max_width = av->geometry.max_width;
 			core.max_height = av->geometry.max_height;
+			core.base_width = av->geometry.base_width;
+			core.base_height = av->geometry.base_height;
 			renderer.dst_p = 0;
 
 			// RA semantics (runloop.c SET_SYSTEM_AV_INFO): the hw-render
@@ -218,8 +237,18 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 		if (geom) {
 			double a = geom->aspect_ratio;
 			if (a <= 0) a = (double)geom->base_width / geom->base_height;
-			core.aspect_ratio = a;
-			renderer.dst_p = 0;
+			// RA runloop.c:3066-3068: SET_GEOMETRY only acts when the
+			// meaningful fields actually changed, and it never resizes the
+			// hw-render FBO (only SET_SYSTEM_AV_INFO -> CMD_EVENT_REINIT
+			// does, runloop.c:2813-2850 / gl3.c:3239).
+			if (core.base_width != geom->base_width
+					|| core.base_height != geom->base_height
+					|| core.aspect_ratio != a) {
+				core.base_width = geom->base_width;
+				core.base_height = geom->base_height;
+				core.aspect_ratio = a;
+				renderer.dst_p = 0;
+			}
 		}
 		return true;
 	}
@@ -446,12 +475,23 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 		return true;
 	}
 	// RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE (0x800004, RetroArch block)
-	// Core asks the frontend to poll input early (before the frame). minarch
-	// polls input via PAD_poll in its own main loop and forwards it to the
-	// core's poll_cb during retro_run, so the early/late scheduling distinction
-	// does not apply. Acknowledge the request; *out belongs to the core.
+	// The core says WHO polls input for each frame: 1 = EARLY (frontend polls
+	// before retro_run and the core will NOT call our poll_cb), 2 = LATE
+	// (frontend polls after retro_run), 0 = don't care (the core calls
+	// poll_cb, which is what every other core does). mupen64plus-next sends
+	// EARLY when ThreadedRenderer=True (libretro/libretro.c:1026-1029), and
+	// its own frame path then skips poll_cb entirely
+	// (mupen64plus-core/src/main/main.c:259-263 main_check_inputs). So merely
+	// acknowledging the request leaves the frontend never polling: no
+	// buttons, no menu, no shortcuts -- input_poll_callback() is the one
+	// place that runs PAD_poll + shortcuts (ma_input.c:17). RA implements
+	// both sides in core_run (runloop.c:9116-9117 early, 9157-9159 late);
+	// minarch's main loop does the same for this value.
 	case 0x800004: {
-		LOG_info("minarch: POLL_TYPE_OVERRIDE acknowledged\n");
+		if (data) {
+			input_poll_type_override = (int)*(const unsigned *)data;
+			LOG_info("minarch: POLL_TYPE_OVERRIDE = %d\n", input_poll_type_override);
+		}
 		return true;
 	}
 	default:
