@@ -1437,8 +1437,20 @@ static void update_debug_hud_texture(void) {
 	glBindTexture(GL_TEXTURE_2D, dbg_hud_tex);
 	PLAT_gl_unpack_reset();
 	if (!dbg_hud_tex_sized) {
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		// NEAREST, matching the effect/overlay/notification layers (and the
+		// software path's HUD, which is stamped into the core frame and only
+		// ever scaled by the chain's own filter). The HUD surface is exactly
+		// half the device (360x240) and the composite draws it as a
+		// clip-space quad over the full 720x480 viewport -- exactly 2x. GL
+		// samples a 2x-magnified texel at s = x/2 + 0.25, i.e. a 0.25-texel
+		// phase off the texel centre, so GL_LINEAR was a real 0.75/0.25
+		// blend between neighbouring texels (measured: 0.00 of the near-white
+		// dot-matrix pixels had an identical horizontal neighbour, where 2x
+		// replication gives ~0.5). That only softened the font and bled the
+		// transparent background through the glyph edges; NEAREST restores
+		// the exact 2x replication the half-res design is for.
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
@@ -1564,7 +1576,34 @@ SDL_GLContext PLAT_getGLContext(void) { return vid.gl_context; }
 // overlay pass (s_pass_overlay, overlay.glsl) with blending on -- never the
 // present program, whose fragment shader forces alpha = 1 (RA modern_opaque)
 // and whose vertex shader applies the present MVP.
+//
+// BLEND STATE DISCIPLINE (2026-09-17, N64 edge-band root cause): the overlay
+// pass is the ONLY draw in this frontend that ENABLES a GL cap -- runShaderPass
+// turns GL_BLEND on for an alpha pass (ma_chain.c: alpha==1 -> glEnable
+// (GL_BLEND) + glBlendFunc).  Everything else here only ever disables caps.
+// For a libretro GL core that shares this context (mupen64plus-next/GLideN64
+// through glsm) that asymmetry is a real leak: glsm tracks only the caps the
+// CORE toggled itself (gl_state.cap_state) and its per-frame
+// glsm_ctl(GLSM_CTL_STATE_BIND/UNBIND) re-establishes exactly those
+// (glsm.c:3117-3156, 3219-3236).  A cap the frontend enabled behind glsm's
+// back is never turned back off, so the core's next frame ran with GL_BLEND
+// still enabled and with the overlay's blend func -- its opaque writes became
+// blended and the outermost rows of the frame (which the core's own draws do
+// not fully cover) kept stale colour: the "N64 + debug HUD edge band".
+// Measured (device, N64 SM64, HUD on, 5-6 samples per condition): without this
+// restore the top/bottom two rows carry 150..436 non-black px that grow with
+// the scene; with it, 0/0/0/0 in every sample.  Restoring the blend state the
+// composite found costs four state queries per frame and makes the composite
+// leave no trace in a context the core's cached state machine owns.
 void PLAT_composite_overlays(int effect_x, int effect_y, unsigned int pipeline_src) {
+	GLint blend_prev_enabled = 0;
+	GLint blend_prev_src = GL_ONE, blend_prev_dst = GL_ZERO;
+	GLint blend_prev_eq = GL_FUNC_ADD;
+	glGetIntegerv(GL_BLEND, &blend_prev_enabled);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &blend_prev_src);
+	glGetIntegerv(GL_BLEND_DST_RGB, &blend_prev_dst);
+	glGetIntegerv(GL_BLEND_EQUATION_RGB, &blend_prev_eq);
+
 	if (effect_tex) {
 		overlay_pass_src(effect_w, effect_h);
 		runShaderPass(
@@ -1615,6 +1654,11 @@ void PLAT_composite_overlays(int effect_x, int effect_y, unsigned int pipeline_s
 	if (PLAT_debug_hud_active()) {
 		update_debug_hud_texture();
 		if (dbg_hud_tex) {
+			// The OVERLAY pass is the one draw in the frontend that ENABLES
+			// GL_BLEND (runShaderPass: alpha==1 pass -> glEnable(GL_BLEND) +
+			// glBlendFunc). See the blend save/restore at the top of this
+			// function: the core's own cap bookkeeping does not know about
+			// that enable, so it must not be left behind.
 			overlay_pass_src(dbg_hud_w, dbg_hud_h);
 			runShaderPass(
 				&s_pass_overlay, dbg_hud_tex, pipeline_src,
@@ -1624,6 +1668,17 @@ void PLAT_composite_overlays(int effect_x, int effect_y, unsigned int pipeline_s
 				NULL, 0, 1);
 		}
 	}
+
+	// Leave the blend state exactly as this composite found it: the core's
+	// cap bookkeeping (glsm_state.cap_state) never saw the enable above and
+	// will not turn it back off (see the header comment). glBlendFunc also
+	// writes the alpha factors to these values; the only remaining consumer
+	// of this context is the core, whose next STATE_BIND re-establishes its
+	// own blendfunc/blendfunc_separate.
+	if (blend_prev_enabled) glEnable(GL_BLEND);
+	else                   glDisable(GL_BLEND);
+	glBlendFunc((GLenum)blend_prev_src, (GLenum)blend_prev_dst);
+	glBlendEquation((GLenum)blend_prev_eq);
 }
 
 // ---------------------------------------------------------------------------
