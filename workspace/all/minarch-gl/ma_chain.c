@@ -151,6 +151,15 @@ static const float gl_chain_mvp[16] = {
 	-1.f, -1.f, 0.f, 1.f,
 };
 
+// FrameCount uniform for the NEXT runShaderPass draw, consumed by that draw.
+// RA reaches it only for a pass whose SOURCE is a previous pass
+// (shader_glsl.c:1430 `&& glsl->active_idx`), and takes the modulo from that
+// source pass's frame_count_mod.  This engine has no preset-side slot for
+// frame_count_mod -- glslp.c ignores that key by design -- so the raw counter
+// is passed.  -1 = leave the uniform alone (RA does that for the first pass,
+// whose source is the core frame).
+static int s_draw_frame_count = -1;
+
 void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 				   GLuint orig_texture_src, GLuint * target_texture, int next_filter,
                    int x, int y, int dst_width, int dst_height,
@@ -319,7 +328,9 @@ void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
 	// calls set_params per pass): the size uniforms change between passes,
 	// so a program re-used across passes must still get fresh values.
 	if (shader_program->u_FrameDirection >= 0) glUniform1i(shader_program->u_FrameDirection, 1);
-	if (shader_program->u_FrameCount >= 0) glUniform1i(shader_program->u_FrameCount, frame_count);
+	if (shader_program->u_FrameCount >= 0 && s_draw_frame_count >= 0)
+		glUniform1i(shader_program->u_FrameCount, s_draw_frame_count);
+	s_draw_frame_count = -1; // one-shot, like RA's per-pass parameters
 	if (shader_program->u_OutputSize >= 0) glUniform2f(shader_program->u_OutputSize, dst_width, dst_height);
 	if (shader_program->u_TextureSize >= 0) glUniform2f(shader_program->u_TextureSize, shader_pass->texw, shader_pass->texh);
 	if (shader_program->u_InputSize >= 0) glUniform2f(shader_program->u_InputSize, shader_pass->srcw, shader_pass->srch);
@@ -547,6 +558,9 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 		}
 		shaderinfocount++;
 
+		// RA: FrameCount reaches a pass only when its source is a previous
+		// pass; pass 0 samples the core frame and gets none.
+		s_draw_frame_count = (i > 0) ? frame_count : -1;
 		runShaderPass(
 			&shaders[i],
 			(i == 0) ? src_texture : shaders[i - 1].target_texture,
@@ -597,6 +611,9 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 
 	float final_mvp[16];
 	PLAT_compute_present_mvp(rotation, final_mvp);
+	// The final pass draws with the last chain pass as its source, so RA gives
+	// it FrameCount as well (shader_glsl.c:1430-1438).
+	s_draw_frame_count = frame_count;
 	runShaderPass(
 		final_pass,
 		final_src,

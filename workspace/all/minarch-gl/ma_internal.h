@@ -100,6 +100,7 @@ extern int show_menu;
  * 0 = don't care, 1 = EARLY, 2 = LATE). Set in ma_environment.c, consumed by
  * the main loop in minarch.c. */
 extern int input_poll_type_override;
+extern int input_state_polled_this_frame;
 extern int newScreenshot;
 extern int fast_forward;
 extern int rewinding;

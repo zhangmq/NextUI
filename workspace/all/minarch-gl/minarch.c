@@ -270,25 +270,30 @@ int main(int argc , char* argv[]) {
 		 * RA-style pace composition). */
 		ma_audio_wrote_frame = 0;
 
-		/* RA core_run's early poll: a core that asked for EARLY through
-		 * RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE does not own the poll (RA
-		 * core_run:9116-9117) -- flycast and mupen64plus-next announce it
-		 * whenever their threaded renderer is on, and mupen then never calls
-		 * poll_cb at all (mupen64plus-core/src/main/main.c:259-263). Under an
-		 * override the core's callback is a no-op (core_input_poll_callback),
-		 * so the frame contains exactly one poll: this one, or the LATE one
-		 * below. With the default value (0) nothing changes: the core polls.
+		/* RA core_run's poll composition, keyed on RA's four-value override
+		 * enum (DONTCARE 0 / EARLY 1 / NORMAL 2 / LATE 3):
+		 *   EARLY  - the frontend polls here, before retro_run (RA
+		 *            core_run:9116-9117).  flycast and mupen64plus-next ask
+		 *            for it whenever their threaded renderer is on, and mupen
+		 *            then never calls poll_cb at all
+		 *            (mupen64plus-core/src/main/main.c:259-263).
+		 *   NORMAL - the core polls through our poll_cb when it asks
+		 *            (core_input_poll_callback), so nothing happens here.
+		 *   LATE   - the frontend polls on the core's first input_state read
+		 *            of the frame (core_input_state_callback), which is what
+		 *            the flag below is cleared for.
+		 * DONTCARE (0, the default) behaves as NORMAL, RA's own default.
 		 * Known interaction: the rewind-wait paths in run_frame poll by
 		 * themselves, so an override core would poll twice on those frames
-		 * (rewind engaged only). RA guards the same case with
-		 * RETRO_CORE_FLAG_INPUT_POLLED. */
-		if (input_poll_type_override == 1)
+		 * (rewind engaged only); RA guards the same case with
+		 * RETRO_CORE_FLAG_INPUT_POLLED, which is the flag this mirrors. */
+		input_state_polled_this_frame = 0;
+		if (input_poll_type_override == 1) {
+			input_state_polled_this_frame = 1;
 			input_poll_callback();
+		}
 
 		run_frame();
-
-		if (input_poll_type_override == 2)
-			input_poll_callback();
 
 		// Hardware-render cores present from their own video callback
 		// (MA_GL_video_refresh), the same place the software path presents

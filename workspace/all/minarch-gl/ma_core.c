@@ -31,8 +31,25 @@ void Core_getName(char* in_name, char* out_name) {
 //     no-op, even though flycast calls poll_cb() anyway
 //     (shell/libretro/libretro.cpp:1078).
 void core_input_poll_callback(void) {
-	if (input_poll_type_override == 0)
+	// RA core_input_state_poll_maybe (runloop.c:5069-5078): the callback the
+	// core calls polls only under NORMAL.  DONTCARE(0) is RA's default for a
+	// core (POLL_TYPE_NORMAL), and EARLY(1)/LATE(3) are polled by the
+	// frontend instead (the main loop / core_input_state_callback below).
+	if (input_poll_type_override == 0 || input_poll_type_override == 2)
 		input_poll_callback();
+}
+
+// LATE: RA polls on the core's first retro_input_state read of the frame
+// (core_input_state_poll_late, runloop.c:5060-5065), i.e. from inside the
+// core's own frame.  Wrapping the libretro callback here keeps ma_input.c --
+// an upstream file the overlay does not override -- untouched.
+static int16_t core_input_state_callback(unsigned port, unsigned device,
+		unsigned index, unsigned id) {
+	if (input_poll_type_override == 3 && !input_state_polled_this_frame) {
+		input_state_polled_this_frame = 1;
+		input_poll_callback();
+	}
+	return input_state_callback(port, device, index, id);
 }
 
 void Core_open(const char* core_path, const char* tag_name) {
@@ -105,7 +122,7 @@ void Core_open(const char* core_path, const char* tag_name) {
 	set_audio_sample_callback(audio_sample_callback);
 	set_audio_sample_batch_callback(audio_sample_batch_callback);
 	set_input_poll_callback(core_input_poll_callback);
-	set_input_state_callback(input_state_callback);
+	set_input_state_callback(core_input_state_callback);
 }
 void Core_init(void) {
 	LOG_info("Core_init\n");

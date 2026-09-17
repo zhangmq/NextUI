@@ -140,6 +140,7 @@ static GLuint ma_gl_sample_tex(void) {
 // re-attaches it later on restore.
 static bool ma_gl_create_fbo(int depth, int stencil) {
 	unsigned dim = ma_gl_fbo_dim();
+	int complete = 1;
 	if (dim < 1) dim = 1;
 	for (unsigned i = 0; i < MA_GL_FBO_COUNT; i++)
 	{
@@ -171,9 +172,9 @@ static bool ma_gl_create_fbo(int depth, int stencil) {
 					GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
 
 		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-			ma_gl_fbo_valid = false;
+			complete = 0;
 	}
-	ma_gl_fbo_valid = true;
+	ma_gl_fbo_valid = complete;
 	ma_gl_fbo_dim_cur = dim;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1051,6 +1052,9 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 			if (show_debug) GFX_frame_stats_display_only(core.fps);
 			MA_present_frame();
 		}
+		// RA counts every video_cb, dupes included (video_driver.c:6011),
+		// because the shader chain's FrameCount is a frame counter.
+		frame_count++;
 		return;
 	}
 
@@ -1094,6 +1098,9 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	// divergence had no measured benefit to pay for it.
 	if (show_debug) GFX_frame_stats_display_only(core.fps);
 	MA_present_frame();
+	// Same counter as the software path's (PLAT_GL_Swap): every presented
+	// frame advances it, so FrameCount-driven shaders animate on hw cores too.
+	frame_count++;
 }
 
 // Hardware-path present accounting: how many video_cb calls actually carried

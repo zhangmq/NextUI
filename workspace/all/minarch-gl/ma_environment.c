@@ -8,11 +8,26 @@
 #include "ra_integration.h"
 #include "ma_environment.h"
 
-// RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE, in RetroArch's enum poll_type values
-// (DONTCARE 0 / EARLY 1 / LATE 2). 0 = the core polls itself through our
-// poll_cb (every other core); see the handler for why a non-zero value must
-// change the main loop, not just the return value.
+// RETRO_ENVIRONMENT_POLL_TYPE_OVERRIDE, raw core value: RA's
+// enum poll_type_override_t (runloop.h:92-98)
+//   DONTCARE 0 / EARLY 1 / NORMAL 2 / LATE 3
+// which RA converts to its internal enum poll_type as `override - 1`
+// (runloop.c:5073-5075; internal EARLY 0 / NORMAL 1 / LATE 2).  Behaviour:
+//   DONTCARE  the core polls itself through our poll_cb -- and that is RA's
+//             default for a core anyway (poll_type = POLL_TYPE_NORMAL,
+//             runloop.c:8750);
+//   EARLY     the frontend polls before retro_run;
+//   NORMAL    the core polls through our poll_cb, when it asks;
+//   LATE      the frontend polls on the core's first retro_input_state call of
+//             the frame (RA core_input_state_poll_late, runloop.c:5060-5065).
+// An earlier version of this file documented a THREE-value enum and therefore
+// treated 2 as LATE (and 3 as not-a-case), which would have left a core asking
+// for LATE with no poll at all.
 int input_poll_type_override = 0;
+
+// Set once per frame by the LATE lazy poll, cleared by the main loop; RA's
+// RETRO_CORE_FLAG_INPUT_POLLED equivalent.
+int input_state_polled_this_frame = 0;
 
 static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uint16_t strength) {
 	// TODO: handle other args? not sure I can
