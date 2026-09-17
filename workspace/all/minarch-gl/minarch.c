@@ -295,6 +295,11 @@ int main(int argc , char* argv[]) {
 
 		run_frame();
 
+		// Deferred auto-resume (see ma_saves.c): mupen64plus-next refuses a
+		// state load until its emulator thread has run once, so the startup
+		// attempt is retried here, right after the first frames.
+		if (State_resume_pending()) State_resume_retry();
+
 		// Hardware-render cores present from their own video callback
 		// (MA_GL_video_refresh), the same place the software path presents
 		// from -- RetroArch's shape, drawn and flipped inside the core's

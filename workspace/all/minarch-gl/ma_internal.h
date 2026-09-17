@@ -147,6 +147,11 @@ extern int rewind_init_ready;
 
 #include "ma_rewind.h"
 
+// Deferred auto-resume (see ma_saves.c): a core that refuses retro_unserialize
+// until it has run once (mupen64plus-next does) is retried from the run loop.
+int State_resume_pending(void);
+void State_resume_retry(void);
+
 /* -----------------------------------------------------------------------
    Input / shortcut / options enums and types
    Moved from minarch.c so the input module can access them.

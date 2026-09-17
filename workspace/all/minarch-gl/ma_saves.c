@@ -197,6 +197,13 @@ void State_getPath(char* filename) {
 }
 
 #define RASTATE_HEADER_SIZE 16
+// State_read() reports "[ERROR] Error restoring save state" itself.  The
+// speculative auto-resume attempts below fail routinely while the core is still
+// initializing, so they stay quiet: only the last one keeps that message (and
+// State_resume_retry follows it with the give-up line).  Every other State_read
+// caller leaves this 0 and gets the message as before.
+static int state_read_quiet = 0;
+
 int State_read(void) { // from picoarch
 	// Block load states in RetroAchievements hardcore mode
 	if (RA_isHardcoreModeActive()) {
@@ -280,7 +287,7 @@ int State_read(void) { // from picoarch
 	}
 
 	if (!core.unserialize(state, state_size)) {
-	  LOG_error("Error restoring save state: %s\n", filename);
+	  if (!state_read_quiet) LOG_error("Error restoring save state: %s\n", filename);
 	  goto error;
 	}
 	success = 1;
@@ -336,7 +343,7 @@ error:
 	}
 
 	if (!core.unserialize(state, state_size)) {
-		LOG_error("Error restoring save state: %s\n", filename);
+		if (!state_read_quiet) LOG_error("Error restoring save state: %s\n", filename);
 		goto error;
 	}
 	success = 1;
@@ -423,13 +430,79 @@ void State_autosave(void) {
 	State_write();
 	state_slot = last_state_slot;
 }
+// Auto-resume at startup cannot always work in one shot: mupen64plus-next
+// returns false from retro_unserialize until its emulator thread/coroutine has
+// run once (libretro.c: `if (initializing) return false;`, cleared at the end
+// of the first retro_run), while flycast has no such guard and loads fine
+// during Core_load.  So the load is retried from the run loop right after the
+// first frames; a failure that survives the retries is logged and dropped --
+// the game then simply continues from a fresh boot, the same outcome as today.
+#define RESUME_MAX_ATTEMPTS 3
+static int resume_slot = -1; // pending auto-resume slot, -1 = none
+static int resume_attempts = 0;
+
+static int state_resume_try(int slot) {
+	int last_state_slot = state_slot;
+	state_slot = slot;
+	int ok = State_read();
+	state_slot = last_state_slot;
+	return ok;
+}
+
+static int state_file_exists(int slot) {
+	int last_state_slot = state_slot;
+	state_slot = slot;
+	char filename[MAX_PATH];
+	State_getPath(filename);
+	state_slot = last_state_slot;
+	return exists(filename);
+}
+
+int State_resume_pending(void) { return resume_slot >= 0; }
+
 void State_resume(void) {
 	if (!exists(RESUME_SLOT_PATH)) return;
 
-	int last_state_slot = state_slot;
-	state_slot = getInt(RESUME_SLOT_PATH);
+	int slot = getInt(RESUME_SLOT_PATH);
 	unlink(RESUME_SLOT_PATH);
-	State_read();
-	state_slot = last_state_slot;
-	Rewind_on_state_change();
+
+	// This first attempt is speculative (see the note above): State_read's own
+	// "Error restoring save state" is only worth reporting if it also fails on
+	// the retries below.
+	state_read_quiet = 1;
+	int ok = state_resume_try(slot);
+	state_read_quiet = 0;
+	if (ok) {
+		Rewind_on_state_change();
+		return;
+	}
+
+	// Only a core that is not ready yet is worth retrying: a missing state
+	// file or hardcore mode will not change a few frames later.
+	if (RA_isHardcoreModeActive() || !state_file_exists(slot)) return;
+
+	resume_slot = slot;
+	resume_attempts = 0;
+	LOG_info("Auto-resume deferred: core is not ready for a state load yet\n");
+}
+
+void State_resume_retry(void) {
+	if (resume_slot < 0) return;
+
+	resume_attempts++;
+	state_read_quiet = (resume_attempts < RESUME_MAX_ATTEMPTS);
+	int ok = state_resume_try(resume_slot);
+	state_read_quiet = 0;
+	if (ok) {
+		LOG_info("Auto-resume applied after %i frame(s)\n", resume_attempts);
+		resume_slot = -1;
+		Rewind_on_state_change();
+		return;
+	}
+
+	if (resume_attempts >= RESUME_MAX_ATTEMPTS) {
+		LOG_error("Auto-resume failed after %i attempts; continuing without it\n",
+				resume_attempts);
+		resume_slot = -1;
+	}
 }
