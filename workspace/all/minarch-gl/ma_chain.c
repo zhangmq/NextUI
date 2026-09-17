@@ -152,12 +152,14 @@ static const float gl_chain_mvp[16] = {
 };
 
 // FrameCount uniform for the NEXT runShaderPass draw, consumed by that draw.
-// RA reaches it only for a pass whose SOURCE is a previous pass
-// (shader_glsl.c:1430 `&& glsl->active_idx`), and takes the modulo from that
-// source pass's frame_count_mod.  This engine has no preset-side slot for
-// frame_count_mod -- glslp.c ignores that key by design -- so the raw counter
-// is passed.  -1 = leave the uniform alone (RA does that for the first pass,
-// whose source is the core frame).
+// RA delivers it to EVERY user pass: the renderchain draws the first user pass
+// with active_idx 1 (gl2.c:4081 `use(..., 1, true)`) and shader_glsl.c:1430
+// only skips active_idx 0, which is the stock final/blend program slot, not a
+// user pass.  The modulo comes from pass[active_idx - 1], i.e. that same
+// pass's own frame_count_mod.  This engine has no preset-side slot for
+// frame_count_mod (glslp.c ignores that key by design), so the raw counter is
+// passed.  -1 = leave the uniform alone, which is what the frontend's own
+// overlay/HUD/UI draws get (RA's stock-blend equivalents).
 static int s_draw_frame_count = -1;
 
 void runShaderPass(ShaderPass * shader_pass, GLuint src_texture,
@@ -559,9 +561,10 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 		}
 		shaderinfocount++;
 
-		// RA: FrameCount reaches a pass only when its source is a previous
-		// pass; pass 0 samples the core frame and gets none.
-		s_draw_frame_count = (i > 0) ? frame_count : -1;
+		// RA hands FrameCount to every user pass, the first one included
+		// (see s_draw_frame_count above): a single-pass shader that reads it
+		// animates in RA too.
+		s_draw_frame_count = frame_count;
 		runShaderPass(
 			&shaders[i],
 			(i == 0) ? src_texture : shaders[i - 1].target_texture,
@@ -612,8 +615,8 @@ void PLAT_run_shader_pipeline(GLuint src_texture, GLuint orig_texture_src,
 
 	float final_mvp[16];
 	PLAT_compute_present_mvp(rotation, final_mvp);
-	// The final pass draws with the last chain pass as its source, so RA gives
-	// it FrameCount as well (shader_glsl.c:1430-1438).
+	// The final pass samples the last chain pass; give it the counter too (the
+	// stock program does not declare the uniform, so this is inert here).
 	s_draw_frame_count = frame_count;
 	runShaderPass(
 		final_pass,
