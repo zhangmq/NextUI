@@ -35,7 +35,7 @@ UPSTREAM_SOURCE = minarch.c ma_cheats.c ma_rewind.c ma_audio.c ma_input.c \
 	ma_options.c ma_frontend_opts.c ma_saves.c ma_video.c ma_core.c ma_game.c \
 	ma_environment.c ma_config.c ma_menu.c ma_runframe.c \
 	../common/utils.c ../common/config.c api.c \
-	../common/notification.c ../../h700/platform/platform.c \
+	../common/notification.c platform.c \
 	../common/http.c ../common/ra_badges.c ../common/ra_offline.c \
 	../common/ra_sync.c ../common/ra_event_queue.c ra_integration.c chd_reader.c \
 	glslp.c ma_chain.c ma_gl.c ma_present.c ma_pace.c ma_preset.c ma_perf.c
