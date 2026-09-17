@@ -1032,18 +1032,21 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	if (!width) width = 1;
 	if (!height) height = 1;
 
-	// RA video_driver_frame semantics: a dupe (data == NULL) carries no new
-	// pixels, so the driver frame is not re-run -- RA skips that frame whole.
-	// We still swap, because this port composites notifications/indicators
-	// through the SDL renderer on the same window (RA composites its widgets
-	// into the GL frame), and the swap keeps the game frame on top of the
-	// renderer's flip.  Measured dupe rate in play: 0 (flycast bursts them
-	// only while its render queue ramps up).
+	// RA video_driver_frame semantics: EVERY video_cb runs the driver frame,
+	// dupes included (video_driver.c: render_frame is only cleared by the
+	// fast-forward frameskip branch), so a dupe still presents -- the FBO
+	// simply still holds the previous frame, which is what re-presenting
+	// shows.  Measured dupe rate in play: 0 on both hw cores (flycast bursts
+	// them only while its render queue ramps up).
 	if (data == NULL) {
 		SDL_Window *dwin = PLAT_getGLWindow();
 		SDL_GLContext dctx = PLAT_getGLContext();
 		mg_dupe_frames++;
-		if (dwin && dctx) { SDL_GL_MakeCurrent(dwin, dctx); MA_present_frame(); }
+		if (dwin && dctx) {
+			SDL_GL_MakeCurrent(dwin, dctx);
+			if (show_debug) GFX_frame_stats_display_only(core.fps);
+			MA_present_frame();
+		}
 		return;
 	}
 
@@ -1075,7 +1078,18 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		if (us > mg_draw_us_max) mg_draw_us_max = us;
 		if (data == VALID) mg_new_frames++; else mg_dupe_frames++;
 	}
-	// The swap is deliberately NOT here: see MA_GL_present_from_loop.
+
+	// Present here, in the video frame callback -- RetroArch's shape
+	// (video_driver.c: every video_cb runs the driver frame, which flips).
+	// The alternative tried earlier, one swap per main-loop iteration, was
+	// measured indistinguishable in the swap statistics on both hw cores:
+	// doa2m 0 blocking swaps either way, N64 4.1-4.2 ms average and 68-71 of
+	// ~250 swaps over 8.3 ms either way.  The blocking is display-paced (a
+	// 50 fps core against a 60 Hz panel waits, a 31 fps core does not) and
+	// ma_pace.c already consumes that same signal as RA's PACE_VSYNC, so the
+	// divergence had no measured benefit to pay for it.
+	if (show_debug) GFX_frame_stats_display_only(core.fps);
+	MA_present_frame();
 }
 
 // Hardware-path present accounting: how many video_cb calls actually carried
@@ -1090,29 +1104,6 @@ void MA_GL_take_present_stats(unsigned* new_frames, unsigned* dupes,
 	if (draw_max_us) *draw_max_us = mg_draw_us_max;
 	mg_new_frames = 0; mg_dupe_frames = 0; mg_draw_us_sum = 0; mg_draw_us_max = 0;
 }
-
-// Present once per main-loop iteration, on the loop's own thread.  The hardware
-// present used to swap from inside the video callback, which for a threaded
-// renderer (flycast) means swapping on the core's render thread: its frames
-// arrive in bursts, so the later swaps of a burst waited for the display to
-// release a buffer (measured in doa2m: 55 of 146 swaps >1ms, 36 >8.3ms, max
-// 10.1ms).  The software path has always presented on the loop thread, where
-// the frame budget is already paced, and never blocks (measured in ddp3: max
-// 0.43ms, zero over 1ms).  Drawing stays in the callback; only the swap moved.
-void MA_GL_present_from_loop(void) {
-	if (!hw_render_active) return;
-	SDL_Window *win = PLAT_getGLWindow();
-	SDL_GLContext ctx = PLAT_getGLContext();
-	if (!win || !ctx) return;
-	SDL_GL_MakeCurrent(win, ctx);
-	// Debug HUD statistics for the hw path: minarch's original sampler with
-	// current_fps left alone (SND_batchSamples resamples core audio by it and
-	// must keep tracking the audio clock, not this loop).  Sampled here
-	// because this is the hw path's once-per-frame loop point.
-	if (show_debug) GFX_frame_stats_display_only(core.fps);
-	MA_present_frame();
-}
-
 
 // Re-make our GL context current after frontend UI activity, so the next
 // retro_run's glsm STATE_BIND + core render start from a known-current

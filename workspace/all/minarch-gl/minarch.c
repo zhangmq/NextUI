@@ -290,10 +290,10 @@ int main(int argc , char* argv[]) {
 		if (input_poll_type_override == 2)
 			input_poll_callback();
 
-		// Hardware-render present, on this thread and once per frame -- the
-		// software path presents from its video callback (also this thread).
-		// See MA_GL_present_from_loop (no-op for software cores).
-		MA_GL_present_from_loop();
+		// Hardware-render cores present from their own video callback
+		// (MA_GL_video_refresh), the same place the software path presents
+		// from -- RetroArch's shape, drawn and flipped inside the core's
+		// video_cb.  Nothing to drive from the main loop.
 
 		// The single pacing site for both core families (see pace_frame).
 		MA_pace_frame();

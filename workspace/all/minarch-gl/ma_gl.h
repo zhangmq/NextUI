@@ -38,11 +38,6 @@ void MA_GL_context_destroy(void);
 // Presents the GL framebuffer the core rendered into.
 void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size_t pitch);
 
-// Presents the frame MA_GL_video_refresh drew, from the main loop (call once
-// per iteration, right after run_frame()).  See its definition in ma_gl.c for
-// why the swap does not live in the video callback.
-void MA_GL_present_from_loop(void);
-
 // Re-draw the last presented hw-render frame (game + chain + overlays) into the
 // currently bound framebuffer. Used by PLAT_GL_screenCapture to capture the
 // presented frame deterministically instead of reading the post-swap window.
