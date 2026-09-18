@@ -210,6 +210,11 @@ static struct SND_Context
 	int frame_out;	  // buf_r
 	int frame_filled; // max_buf_w
 
+	unsigned latency_ms;      // device buffer target (RA audio_latency, ms)
+	unsigned samples;         // power-of-two sample count requested from SDL
+	unsigned underruns;       // RA-style "periods of silence for want of audio"
+	unsigned underrun_frames;
+
 	// When set, SND_batchSamples blocks (cond_wait) on a full ring buffer
 	// instead of dropping frames. Used by the hardware-render path to give
 	// an emulator thread (flycast ThreadedRendering) audio backpressure.
@@ -2599,6 +2604,59 @@ SDL_Color GFX_mapColor(uint32_t c)
 #define SAMPLES 512 // default
 #endif
 
+/* --- Audio: RA-aligned latency and rate control ---------------------------
+ * RA derives the device buffer from the audio latency setting, not from a
+ * constant: audio/audio_driver.c  frames = input_rate * audio_latency / 1000.
+ * SDL wants a power-of-two sample count, so round up - the same normalisation
+ * yabause's sndsdl.c does.
+ *
+ * Default 32 ms: at 44100 Hz that asks SDL for 2048 samples, which this
+ * device's ALSA ends up with as a 4096-frame buffer (~93 ms) - the same
+ * figure the standalone YabaSanshiro runs with, and the value confirmed on
+ * hardware to keep audio glitch tolerance without adding audible lag.
+ * (RA's own default is 64 ms, which lands at 8192 ALSA frames = 186 ms here -
+ * more slack than a handheld needs.)
+ *
+ * RA's dynamic rate control is a bounded proportional term around the
+ * half-full setpoint (audio/audio_driver.c:1268-1345) whose gain is
+ * rate_control_delta; minarch used to allow a measured-fps feed-forward of up
+ * to 1.5x, i.e. it stretched the audio instead of reporting the shortfall.
+ * Overridable per pak through the environment (no new cfg key).
+ * ------------------------------------------------------------------------ */
+#ifndef AUDIO_LATENCY_MS_DEFAULT
+#define AUDIO_LATENCY_MS_DEFAULT 32
+#endif
+#ifndef AUDIO_RATE_CONTROL_DELTA
+#define AUDIO_RATE_CONTROL_DELTA 0.005f
+#endif
+
+static unsigned snd_latency_ms(void)
+{
+	const char *env = getenv("NEXTUI_AUDIO_LATENCY_MS");
+	unsigned v = AUDIO_LATENCY_MS_DEFAULT;
+	if (env && *env)
+	{
+		unsigned long p = 0;
+		const char *q = env;
+		while (*q >= '0' && *q <= '9')
+			p = p * 10 + (unsigned long)(*q++ - '0');
+		if (p >= 1 && p <= 500)
+			v = (unsigned)p;
+	}
+	return v;
+}
+
+static unsigned snd_samples_pow2(unsigned rate, unsigned ms)
+{
+	unsigned target = (unsigned)((double)rate * (double)ms / 1000.0);
+	unsigned n = 256;
+	if (target <= n)
+		return n;
+	while (n < target)
+		n <<= 1;
+	return n;
+}
+
 #define ms SDL_GetTicks
 
 pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2633,7 +2691,16 @@ static void SND_audioCallback(void *userdata, uint8_t *stream, int len)
 	pthread_mutex_unlock(&audio_mutex);
 
 	if (len > 0)
+	{
+		/* RA counts these and reports them at teardown ("periods of silence
+		 * for want of audio", audio/audio_driver.c:1011-1018). */
+		snd.underruns++;
+		snd.underrun_frames += (unsigned)len;
+		if (snd.underruns == 1 || (snd.underruns % 100) == 0)
+			LOG_info("[Audio] underrun #%u: %d frame(s) of silence for want of audio\n",
+					snd.underruns, len);
 		memset(out, 0, len * (sizeof(int16_t) * 2));
+	}
 }
 static void SND_resizeBuffer(void)
 { // plat_sound_resize_buffer
@@ -2905,11 +2972,35 @@ size_t SND_batchSamples(const SND_Frame *frames, size_t frame_count)
 	{
 		bufferadjustment = 0.0f;
 	}
+	/* RA bounds the dynamic term by rate_control_delta (audio_driver.c:1268) */
+	if (bufferadjustment > AUDIO_RATE_CONTROL_DELTA)
+		bufferadjustment = AUDIO_RATE_CONTROL_DELTA;
+	else if (bufferadjustment < -AUDIO_RATE_CONTROL_DELTA)
+		bufferadjustment = -AUDIO_RATE_CONTROL_DELTA;
 
 	float safe_ratio = snd.frame_rate / current_fps;
 	if (!isfinite(safe_ratio))
 	{
 		safe_ratio = 1.0f;
+	}
+	/* RA never trims by the measured fps: keep only a bounded A/V trim, so a
+	 * core that cannot keep up underruns (and is counted) instead of the
+	 * frontend stretching the audio by up to 1.5x. */
+	{
+		static int trim_clamped_logged = 0;
+		float hi = 1.0f + AUDIO_RATE_CONTROL_DELTA;
+		float lo = 1.0f - AUDIO_RATE_CONTROL_DELTA;
+		if (safe_ratio > hi || safe_ratio < lo)
+		{
+			if (!trim_clamped_logged)
+			{
+				trim_clamped_logged = 1;
+				LOG_info("[Audio] fps trim clamped: frame_rate %.2f / measured fps %.2f = %.4f -> %.4f (RA bounds this by rate_control_delta)\n",
+						snd.frame_rate, current_fps, snd.frame_rate / current_fps,
+						safe_ratio > hi ? hi : lo);
+			}
+			safe_ratio = safe_ratio > hi ? hi : lo;
+		}
 	}
 
 	ratio = safe_ratio + bufferadjustment;
@@ -2919,11 +3010,11 @@ size_t SND_batchSamples(const SND_Frame *frames, size_t frame_count)
 		ratio = 1.0;
 	}
 
-	// limit ratio so it wont go crazy for some reason
-	if (ratio > 1.5)
-		ratio = 1.5;
-	else if (ratio < 0.5)
-		ratio = 0.5;
+	/* RA-magnitude bound: base +/- dynamic term stays within ~(1+delta)^2 */
+	if (ratio > 1.0f + 2.0f * AUDIO_RATE_CONTROL_DELTA)
+		ratio = 1.0f + 2.0f * AUDIO_RATE_CONTROL_DELTA;
+	else if (ratio < 1.0f - 2.0f * AUDIO_RATE_CONTROL_DELTA)
+		ratio = 1.0f - 2.0f * AUDIO_RATE_CONTROL_DELTA;
 
 	perf.ratio = (ratio > 0.0) ? ratio : current_fps;
 
@@ -3158,7 +3249,10 @@ void SND_init(double sample_rate, double frame_rate)
 	spec_in.freq = PLAT_pickSampleRate(sample_rate, MAX_SAMPLE_RATE);
 	spec_in.format = AUDIO_S16;
 	spec_in.channels = 2;
-	spec_in.samples = SAMPLES;
+	/* RA: device buffer from the latency setting (power of two for SDL) */
+	snd.latency_ms = snd_latency_ms();
+	snd.samples = snd_samples_pow2(spec_in.freq, snd.latency_ms);
+	spec_in.samples = snd.samples;
 	spec_in.callback = SND_audioCallback;
 
 #if defined(USE_SDL2)
@@ -3194,13 +3288,19 @@ void SND_init(double sample_rate, double frame_rate)
 
 	// start with audiodevice paused so buffer can fill a little, snd_batchsamples will unpause it
 	SND_pauseAudio(true);
-	LOG_info("sample rate: %i (req) %i (rec) [samples %i]\n", snd.sample_rate_in, snd.sample_rate_out, SAMPLES);
+	LOG_info("sample rate: %i (req) %i (rec) [latency %u ms, samples req %u got %u]\n",
+			snd.sample_rate_in, snd.sample_rate_out, snd.latency_ms, snd.samples,
+			(unsigned)spec_out.samples);
 	snd.initialized = 1;
 
 }
 
 void SND_quit(void)
 {
+	if (snd.initialized && snd.underruns)
+		LOG_info("[Audio] %u period(s) of silence for want of audio this session (%u frames)\n",
+				snd.underruns, snd.underrun_frames);
+
 	if (!snd.initialized)
 	{
 		LOG_warn("Skipping SND teardown, not initialized.\n");
