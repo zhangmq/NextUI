@@ -253,6 +253,16 @@ static void ma_gl_ring_publish(void) {
 //     ago; normally long done).
 // A caching core keeps its slot: no fence and no rotation, i.e. exactly the
 // behaviour this frontend had before the ring existed.
+//
+// Fence diagnostics (and an off switch for measurement): MINARCH_RING_FENCE=0
+// skips both the fence and the wait, so the ring rotates without any
+// cross-thread read/write protection.  The counters below report what the wait
+// actually did: ALREADY_SIGNALED means the GPU had long finished reading the
+// slot (the wait cost nothing), CONDITION_SATISFIED means it had to block.
+static int ma_gl_ring_fence_mode = -1;          /* 0 = off, 1 = on */
+static unsigned ma_gl_ring_fence_arms, ma_gl_ring_fence_timeout;
+static unsigned ma_gl_ring_fence_already, ma_gl_ring_fence_blocked;
+
 static void ma_gl_ring_after_present(void) {
 	unsigned presented;
 
@@ -260,6 +270,13 @@ static void ma_gl_ring_after_present(void) {
 	ma_gl_sync_init();
 	presented = ma_gl_ring_present;
 	ma_gl_ring_presents++;
+
+	if (ma_gl_ring_fence_mode < 0) {
+		const char *e = getenv("MINARCH_RING_FENCE");
+		ma_gl_ring_fence_mode = (e && *e == '0') ? 0 : 1;
+		LOG_info("minarch: ring fences %s (MINARCH_RING_FENCE=%s)\n",
+				ma_gl_ring_fence_mode ? "on" : "OFF", e ? e : "unset");
+	}
 
 	if (ma_gl_ring_reqs != ma_gl_ring_reqs_mark) {
 		ma_gl_ring_reqs_mark = ma_gl_ring_reqs;
@@ -285,9 +302,10 @@ static void ma_gl_ring_after_present(void) {
 				(unsigned)MA_GL_FBO_COUNT);
 	}
 
-	if (ma_gl_FenceSync) {
+	if (ma_gl_ring_fence_mode && ma_gl_FenceSync) {
 		ma_gl_ring_sync[presented] = ma_gl_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 		ma_gl_ring_inflight[presented] = (ma_gl_ring_sync[presented] != NULL);
+		ma_gl_ring_fence_arms++;
 	}
 
 	ma_gl_ring_write = (ma_gl_ring_write + 1) % MA_GL_FBO_COUNT;
@@ -302,14 +320,32 @@ static void ma_gl_ring_after_present(void) {
 	if (ma_gl_ring_inflight[ma_gl_ring_write]) {
 		if (ma_gl_ClientWaitSync && ma_gl_ring_sync[ma_gl_ring_write]) {
 			GLenum r = ma_gl_ClientWaitSync(ma_gl_ring_sync[ma_gl_ring_write], 0, 100000000ull);
-			if (r == GL_TIMEOUT_EXPIRED)
+			if (r == GL_TIMEOUT_EXPIRED) {
+				ma_gl_ring_fence_timeout++;
 				LOG_error("minarch: ring fence wait timed out on slot %u\n", ma_gl_ring_write);
+			} else if (r == GL_ALREADY_SIGNALED) {
+				ma_gl_ring_fence_already++;   /* GPU long done: no CPU block */
+			} else {
+				ma_gl_ring_fence_blocked++;   /* CONDITION_SATISFIED: it waited */
+			}
 		}
 		if (ma_gl_DeleteSync && ma_gl_ring_sync[ma_gl_ring_write])
 			ma_gl_DeleteSync(ma_gl_ring_sync[ma_gl_ring_write]);
 		ma_gl_ring_sync[ma_gl_ring_write] = NULL;
 		ma_gl_ring_inflight[ma_gl_ring_write] = false;
 	}
+}
+
+// Fence statistics for the periodic frame telemetry (ma_pace.c): how many
+// fences were armed and what the cross-thread waits actually did.  A core that
+// does not follow the ring never arms one, so the caller sees arms == 0 and
+// prints nothing.
+void MA_GL_take_ring_fence_stats(unsigned* arms, unsigned* already,
+		unsigned* blocked, unsigned* timeout) {
+	if (arms)    *arms    = ma_gl_ring_fence_arms;
+	if (already) *already = ma_gl_ring_fence_already;
+	if (blocked) *blocked = ma_gl_ring_fence_blocked;
+	if (timeout) *timeout = ma_gl_ring_fence_timeout;
 }
 
 // Ring reset: used whenever the FBOs are (re)created, so stale fences and slot

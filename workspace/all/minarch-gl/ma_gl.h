@@ -45,6 +45,8 @@ void MA_GL_present_draw(void);
 
 // Take (and reset) the hardware-path present counters: new vs dupe frames and
 // the cost of our own draw.  See the definitions in ma_gl.c.
+void MA_GL_take_ring_fence_stats(unsigned* arms, unsigned* already,
+		unsigned* blocked, unsigned* timeout);
 void MA_GL_take_present_stats(unsigned* new_frames, unsigned* dupes,
 		uint64_t* draw_sum_us, uint64_t* draw_max_us);
 

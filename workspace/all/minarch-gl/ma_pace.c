@@ -164,8 +164,19 @@ void MA_telemetry_tick(void) {
 			unsigned nf = 0, dp = 0; uint64_t ds = 0, dm = 0;
 			MA_GL_take_present_stats(&nf, &dp, &ds, &dm);
 			if (nf || dp)
-				LOG_info("minarch: hw video_cb: %u new, %u dupe; our draw %.0f us avg, %llu us max\n",
-						nf, dp, (double)ds / (double)(nf + dp), (unsigned long long)dm);
+			{
+				unsigned fa = 0, fal = 0, fb = 0, ft = 0;
+				MA_GL_take_ring_fence_stats(&fa, &fal, &fb, &ft);
+				if (fa)
+					LOG_info("minarch: hw video_cb: %u new, %u dupe; our draw %.0f us avg, "
+							"%llu us max; ring fences %u armed, %u already-signalled, "
+							"%u blocked, %u timeout\n",
+							nf, dp, (double)ds / (double)(nf + dp), (unsigned long long)dm,
+							fa, fal, fb, ft);
+				else
+					LOG_info("minarch: hw video_cb: %u new, %u dupe; our draw %.0f us avg, %llu us max\n",
+							nf, dp, (double)ds / (double)(nf + dp), (unsigned long long)dm);
+			}
 		}
 		memset(buckets, 0, sizeof(buckets));
 		frames = 0; sum_ms = 0.0; worst_ms = 0.0;
