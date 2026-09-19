@@ -51,35 +51,84 @@ static unsigned mg_new_frames = 0, mg_dupe_frames = 0;
 #define RARCH_SCALE_BASE 256u
 
 // ---------------------------------------------------------------------------
-// FBO count: RA's hw-render contract is ONE FBO that the core renders into
-// and that the present path samples directly.
+// FBO count: a RING of slots, because our cores render on their own thread.
 //
-//   gl3 (GL 3.x, RA's current driver): gl3_init_hw_render() creates a single
-//   hw_render_fbo + hw_render_texture pair (gl3.c:2068-2081),
-//   gl3_get_current_framebuffer() returns that FBO verbatim (gl3.c:5610-5616,
-//   no index arithmetic) and the frame samples hw_render_texture
-//   (gl3.c:2782).
-//   gl2 (GL 2.x): hw render forces gl->textures = 1 (gl2.c:5368-5372, "All on
-//   GPU, no need to excessively create textures"), so its
-//   hw_render_fbo[(tex_index + 1) % textures] lookup (gl2.c:3214) and its
-//   per-frame gl->tex_index = (tex_index + 1) % textures flip (gl2.c:4163)
-//   both collapse to index 0. The sampled gl->texture[0] IS the colour
-//   attachment of hw_render_fbo[0] (attached in gl2_renderchain_init_hw_render,
-//   gl2.c:2245-2247) -- render target and sampled texture are the same object.
+// RA's plain hw-render contract is ONE FBO that the core renders into and that
+// the present path samples directly:
+//   gl3: gl3_init_hw_render() creates a single hw_render_fbo + hw_render_texture
+//   pair (gl3.c:2068-2081), gl3_get_current_framebuffer() returns that FBO
+//   verbatim (gl3.c:5610-5616) and the frame samples hw_render_texture
+//   (gl3.c:2782). gl2: hw render forces gl->textures = 1 (gl2.c:5368-5372), so
+//   hw_render_fbo[(tex_index + 1) % textures] (gl2.c:3214) and the tex_index
+//   flip (gl2.c:4163) collapse to index 0 -- render target and sampled texture
+//   are the same object.
 //
-// So there is no second buffer and no per-frame index rotation here either.
-// An earlier dual-buffered variant (get_current_framebuffer returning
-// fbo[(write + 1) % 2] while the present flipped `write` every frame) made the
-// core render into the slot glsm had cached at SETUP while the present
-// alternated between that slot and the never-written one: the picture came up
-// every other frame (observed on N64 as "picture visible but flickering").
+// That is safe only while the core draws on the frontend's thread and in the
+// frontend's context: the present then samples the frame strictly after the
+// core finished writing it. A core that renders on ANOTHER thread with its own
+// (shared) GL context -- ours does, and so do RA's threaded cores -- gets a
+// RING instead: RA's gfx/video_thread_hw.c keeps VIDEO_THREAD_HW_RING (3) slots,
+// hands the core hw_ring_framebuffer(index), advances the index on every
+// published frame, and fences slots between the two threads ("the ring gives
+// them what the swapchain gave them unthreaded"). The core renders into slot N
+// while the present still samples slot N-1.
+//
+// An earlier dual-buffered variant here failed because the core kept rendering
+// into the slot glsm cached at SETUP (get_current_framebuffer is called once
+// there) while the present alternated: the picture came up every other frame
+// (N64, "visible but flickering"). It works now because the core re-reads
+// get_current_framebuffer() every frame and re-points its mirror FBO at the new
+// slot's texture (yaba: yk_adopt_front_fbo / YuiGetFB).
+//
+// Fences: after presenting a slot we fence it (its read must complete before
+// the core may render into it again), and before the core moves on to the next
+// slot we wait that slot's fence if it is still in flight -- RA's
+// hw_ring_capture/hw_ring_fence_wait split, with the waiting done here on the
+// frontend's thread so the core needs no GL fence of its own.
 // ---------------------------------------------------------------------------
-#define MA_GL_FBO_COUNT 1
+#define MA_GL_FBO_COUNT 3
 static GLuint ma_gl_fbo[MA_GL_FBO_COUNT] = { 0 };
 static GLuint ma_gl_fbo_tex[MA_GL_FBO_COUNT] = { 0 };
 static GLuint ma_gl_fbo_rb[MA_GL_FBO_COUNT] = { 0 };
 static bool ma_gl_fbo_valid = false;
 static unsigned ma_gl_fbo_dim_cur = 0; // actual created size (RA tex_w)
+// Ring bookkeeping (frontend thread only): `write` is the slot the core is
+// filling (what get_current_framebuffer returns), `present` the slot the last
+// frame was presented from (what the present path samples).
+static unsigned ma_gl_ring_write = 0, ma_gl_ring_present = 0;
+static GLsync ma_gl_ring_sync[MA_GL_FBO_COUNT] = { 0 };
+static bool ma_gl_ring_inflight[MA_GL_FBO_COUNT] = { false };
+static unsigned ma_gl_ring_log = 0;   // bounded ring tracing (first frames)
+
+// ---------------------------------------------------------------------------
+// Ring opt-in: rotate only for a core that FOLLOWS the ring.
+//
+// glsm cores read hw_render.get_current_framebuffer() exactly once, in
+// glsm_ctl(GLSM_CTL_STATE_SETUP) -- flycast glsm.c:2759, mupen64plus_next
+// glsm.c:3049 -- and cache it as `default_framebuffer` (rglBindFramebuffer even
+// redirects a bind of 0 to it).  Such a core renders into that one slot on the
+// frontend's thread forever: if the present rotated anyway it would sample
+// slots nobody ever wrote, which is exactly the "picture every other frame"
+// failure the earlier two-buffer experiment produced on N64.
+//
+// Our core re-reads it every retro_run (yk_adopt_front_fbo) because its VDP
+// thread needs the slot the frontend hands out next.  So instead of guessing
+// from a name list, the frontend watches the calls: a request arriving between
+// two presents means the core is following the ring; none means it cached the
+// FBO and must keep the single-slot behaviour.  Rotation (and the extra slots,
+// which cost colour+depth memory) start only after two consecutive presents
+// that were followed, and the whole detector resets whenever the FBOs are
+// recreated (a context_reset re-runs glsm's SETUP).
+// ---------------------------------------------------------------------------
+static unsigned ma_gl_ring_reqs = 0;       // get_current_framebuffer calls
+static unsigned ma_gl_ring_reqs_mark = 0;  // value at the last present
+static unsigned ma_gl_ring_follow = 0;     // consecutive presents that re-read
+static unsigned ma_gl_ring_presents = 0;   // presents seen since (re)creation
+static unsigned ma_gl_ring_slots = 1;      // slots actually created
+static int ma_gl_fbo_depth = 0, ma_gl_fbo_stencil = 0; // what the core asked
+static int ma_gl_ring_verdict = 0;         // 0 unknown, 1 single, 2 ring
+static void ma_gl_ring_ensure_slots(void); // creates slots 1..N-1 on demand
+
 
 // Next power of 2 (RA libretro-common retro_math.h next_pow2).
 static unsigned ma_gl_next_pow2(unsigned v) {
@@ -114,21 +163,229 @@ static retro_proc_address_t ma_gl_get_proc_address(const char *sym) {
 	return (retro_proc_address_t)(uintptr_t)SDL_GL_GetProcAddress(sym);
 }
 
-// Returns the frontend FBO the core should render into. Must be current and
-// complete before the core's context_reset runs (glsm reads it in SETUP and
-// caches it as `default_framebuffer`; mupen glsm.c:3049, flycast glsm.c:2759).
-// RA: the one hw-render FBO, returned as-is -- no index arithmetic.
+// Returns the frontend FBO the core should render into: the ring's WRITE slot.
+// glsm caches whatever this returns at SETUP as `default_framebuffer`; a core
+// that renders on another thread must re-read it every frame (ours does), which
+// is exactly what makes the ring possible where the old dual-buffer attempt
+// failed -- and the call counter below is how the ring decides whether this
+// core does.  Called on the frontend's thread.
 static uintptr_t ma_gl_get_current_framebuffer(void) {
-	return ma_gl_fbo_valid ? (uintptr_t)ma_gl_fbo[0] : 0;
+	if (!ma_gl_fbo_valid) return 0;
+	ma_gl_ring_reqs++;
+	return (uintptr_t)ma_gl_fbo[ma_gl_ring_write];
 }
 
-// The texture the present path samples: the colour attachment of that same
-// FBO, bound after glBindFramebuffer(GL_FRAMEBUFFER, 0) so this is not a
-// render-to-sampled-texture feedback loop. RA does the same: gl3 samples
-// hw_render_texture (gl3.c:2782), gl2 samples gl->texture[0] which is
-// attached to hw_render_fbo[0].
+// The texture the present path samples: the colour attachment of the slot the
+// last published frame went into -- NOT the slot the core is filling now.
+// Bound after glBindFramebuffer(GL_FRAMEBUFFER, 0) so this is not a
+// render-to-sampled-texture feedback loop.
 static GLuint ma_gl_sample_tex(void) {
-	return ma_gl_fbo_tex[0];
+	return ma_gl_fbo_tex[ma_gl_ring_present];
+}
+
+// ---------------------------------------------------------------------------
+// Ring fences (frontend thread, frontend context).
+//
+// After a slot has been presented its texture is still being read by the GPU;
+// the core must not draw into that slot again until the read finished.  A
+// GLsync object per slot carries that: signal right after the present, wait
+// before the slot is handed out again.  RA's hw_ring_capture/hw_ring_fence_wait
+// do the same across its two threads (gl2.c: "place a fence after the core's
+// rendering and flush, so the frame on the other thread can wait it").
+// ---------------------------------------------------------------------------
+typedef GLsync (*ma_gl_fencesync_fn)(GLenum, GLbitfield);
+typedef GLenum (*ma_gl_clientwait_fn)(GLsync, GLbitfield, GLuint64);
+typedef GLenum (*ma_gl_fencesync_wait_fn)(GLsync, GLbitfield, GLuint64);
+typedef void   (*ma_gl_deletesync_fn)(GLsync);
+static ma_gl_fencesync_fn      ma_gl_FenceSync;
+static ma_gl_clientwait_fn     ma_gl_ClientWaitSync;
+static ma_gl_fencesync_wait_fn ma_gl_WaitSync;
+static ma_gl_deletesync_fn     ma_gl_DeleteSync;
+static int ma_gl_sync_resolved = 0;
+
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#endif
+#ifndef GL_SYNC_FLUSH_COMMANDS_BIT
+#define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
+#endif
+#ifndef GL_ALREADY_SIGNALED
+#define GL_ALREADY_SIGNALED 0x911A
+#endif
+#ifndef GL_TIMEOUT_EXPIRED
+#define GL_TIMEOUT_EXPIRED 0x911B
+#endif
+#ifndef GL_CONDITION_SATISFIED
+#define GL_CONDITION_SATISFIED 0x911C
+#endif
+#ifndef GL_WAIT_FAILED
+#define GL_WAIT_FAILED 0x911D
+#endif
+
+static void ma_gl_sync_init(void) {
+	if (ma_gl_sync_resolved) return;
+	ma_gl_sync_resolved = 1;
+	ma_gl_FenceSync      = (ma_gl_fencesync_fn)(uintptr_t)SDL_GL_GetProcAddress("glFenceSync");
+	ma_gl_ClientWaitSync = (ma_gl_clientwait_fn)(uintptr_t)SDL_GL_GetProcAddress("glClientWaitSync");
+	ma_gl_WaitSync       = (ma_gl_fencesync_wait_fn)(uintptr_t)SDL_GL_GetProcAddress("glWaitSync");
+	ma_gl_DeleteSync     = (ma_gl_deletesync_fn)(uintptr_t)SDL_GL_GetProcAddress("glDeleteSync");
+	LOG_info("minarch: hw-render ring fences: fence=%p clientwait=%p wait=%p delete=%p\n",
+			(void *)ma_gl_FenceSync, (void *)ma_gl_ClientWaitSync,
+			(void *)ma_gl_WaitSync, (void *)ma_gl_DeleteSync);
+}
+
+// The core just published a frame: it is in the WRITE slot, and that is what
+// the present path must sample (before this, `present` still named the previous
+// frame's slot).
+static void ma_gl_ring_publish(void) {
+	if (!ma_gl_fbo_valid) return;
+	ma_gl_ring_present = ma_gl_ring_write;
+}
+
+// Called after the present of the current frame (frontend thread + context).
+// First decide whether this core follows the ring at all (see the detector
+// above); only then, and only for a following core:
+//  1. fence the slot we just presented -- its read must finish before the core
+//     may render into it again,
+//  2. advance the write slot, so the core's next frame goes somewhere else and
+//     can start while the GPU is still reading this one,
+//  3. wait the new write slot's fence (armed when it was presented two frames
+//     ago; normally long done).
+// A caching core keeps its slot: no fence and no rotation, i.e. exactly the
+// behaviour this frontend had before the ring existed.
+static void ma_gl_ring_after_present(void) {
+	unsigned presented;
+
+	if (!ma_gl_fbo_valid) return;
+	ma_gl_sync_init();
+	presented = ma_gl_ring_present;
+	ma_gl_ring_presents++;
+
+	if (ma_gl_ring_reqs != ma_gl_ring_reqs_mark) {
+		ma_gl_ring_reqs_mark = ma_gl_ring_reqs;
+		if (ma_gl_ring_follow < 3) ma_gl_ring_follow++;
+	} else {
+		ma_gl_ring_follow = 0;
+		/* the first present is ambiguous (glsm's SETUP read may be the only
+		 * one so far): judge from the second one on. */
+		if (ma_gl_ring_verdict == 0 && ma_gl_ring_presents > 1) {
+			ma_gl_ring_verdict = 1;
+			LOG_info("minarch: core caches the hw-render FBO (glsm SETUP) -- "
+					"single slot, no ring rotation\n");
+		}
+	}
+
+	if (MA_GL_FBO_COUNT < 2 || ma_gl_ring_follow < 2)
+		return;   /* single-slot behaviour: the core renders where it presents */
+
+	if (ma_gl_ring_verdict != 2) {
+		ma_gl_ring_verdict = 2;
+		ma_gl_ring_ensure_slots();
+		LOG_info("minarch: core follows the hw-render ring -- rotating %u slots\n",
+				(unsigned)MA_GL_FBO_COUNT);
+	}
+
+	if (ma_gl_FenceSync) {
+		ma_gl_ring_sync[presented] = ma_gl_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		ma_gl_ring_inflight[presented] = (ma_gl_ring_sync[presented] != NULL);
+	}
+
+	ma_gl_ring_write = (ma_gl_ring_write + 1) % MA_GL_FBO_COUNT;
+	if (ma_gl_ring_log < 24)
+	{
+		LOG_info("minarch: ring present=%u next-write=%u fbo=%u tex=%u\n",
+				presented, ma_gl_ring_write,
+				(unsigned)ma_gl_fbo[presented], (unsigned)ma_gl_fbo_tex[presented]);
+		ma_gl_ring_log++;
+	}
+
+	if (ma_gl_ring_inflight[ma_gl_ring_write]) {
+		if (ma_gl_ClientWaitSync && ma_gl_ring_sync[ma_gl_ring_write]) {
+			GLenum r = ma_gl_ClientWaitSync(ma_gl_ring_sync[ma_gl_ring_write], 0, 100000000ull);
+			if (r == GL_TIMEOUT_EXPIRED)
+				LOG_error("minarch: ring fence wait timed out on slot %u\n", ma_gl_ring_write);
+		}
+		if (ma_gl_DeleteSync && ma_gl_ring_sync[ma_gl_ring_write])
+			ma_gl_DeleteSync(ma_gl_ring_sync[ma_gl_ring_write]);
+		ma_gl_ring_sync[ma_gl_ring_write] = NULL;
+		ma_gl_ring_inflight[ma_gl_ring_write] = false;
+	}
+}
+
+// Ring reset: used whenever the FBOs are (re)created, so stale fences and slot
+// indices never outlive the objects they refer to -- and so the follow detector
+// starts over (a context_reset re-runs glsm's SETUP).
+static void ma_gl_ring_reset(void) {
+	for (unsigned i = 0; i < MA_GL_FBO_COUNT; i++) {
+		if (ma_gl_ring_sync[i] && ma_gl_DeleteSync)
+			ma_gl_DeleteSync(ma_gl_ring_sync[i]);
+		ma_gl_ring_sync[i] = NULL;
+		ma_gl_ring_inflight[i] = false;
+	}
+	ma_gl_ring_write = 0;
+	ma_gl_ring_present = 0;
+	ma_gl_ring_slots = 1;
+	ma_gl_ring_reqs_mark = ma_gl_ring_reqs;
+	ma_gl_ring_follow = 0;
+	ma_gl_ring_presents = 0;
+	ma_gl_ring_verdict = 0;
+}
+
+// One ring slot: colour texture + optional depth/stencil, both sized to the
+// driver's power-of-two dim.  Returns true when the FBO is complete.
+static bool ma_gl_create_slot(unsigned i, unsigned dim, int depth, int stencil) {
+	glGenTextures(1, &ma_gl_fbo_tex[i]);
+	glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex[i]);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dim, dim, 0,
+			GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	if (depth) {
+		glGenRenderbuffers(1, &ma_gl_fbo_rb[i]);
+		glBindRenderbuffer(GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
+		glRenderbufferStorage(GL_RENDERBUFFER,
+				stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16,
+				dim, dim);
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	}
+
+	glGenFramebuffers(1, &ma_gl_fbo[i]);
+	glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_fbo[i]);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			GL_TEXTURE_2D, ma_gl_fbo_tex[i], 0);
+	if (depth)
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER,
+				stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+				GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
+
+	return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+// Slots 1..N-1 exist only for a core that follows the ring (see the detector
+// above): a caching core never needs them, and each one costs a colour texture
+// plus a depth/stencil renderbuffer at the driver's dimension.  Created here,
+// on the frontend's thread with the frontend's context current, right after the
+// present that proved the core follows.
+static void ma_gl_ring_ensure_slots(void) {
+	if (ma_gl_ring_slots >= MA_GL_FBO_COUNT) return;
+	if (MA_GL_FBO_COUNT < 2) return;
+	for (unsigned i = 1; i < MA_GL_FBO_COUNT; i++) {
+		if (!ma_gl_create_slot(i, ma_gl_fbo_dim_cur, ma_gl_fbo_depth, ma_gl_fbo_stencil)) {
+			ma_gl_fbo_valid = false;
+			LOG_error("minarch: ring slot %u incomplete\n", i);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			glBindRenderbuffer(GL_RENDERBUFFER, 0);
+			return;
+		}
+	}
+	ma_gl_ring_slots = MA_GL_FBO_COUNT;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindRenderbuffer(GL_RENDERBUFFER, 0);
 }
 
 // The depth/stencil attachment follows the CORE'S REQUEST, exactly like RA
@@ -140,42 +397,14 @@ static GLuint ma_gl_sample_tex(void) {
 // re-attaches it later on restore.
 static bool ma_gl_create_fbo(int depth, int stencil) {
 	unsigned dim = ma_gl_fbo_dim();
-	int complete = 1;
 	if (dim < 1) dim = 1;
-	for (unsigned i = 0; i < MA_GL_FBO_COUNT; i++)
-	{
-		glGenTextures(1, &ma_gl_fbo_tex[i]);
-		glBindTexture(GL_TEXTURE_2D, ma_gl_fbo_tex[i]);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dim, dim, 0,
-				GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-		if (depth) {
-			glGenRenderbuffers(1, &ma_gl_fbo_rb[i]);
-			glBindRenderbuffer(GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
-			glRenderbufferStorage(GL_RENDERBUFFER,
-					stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16,
-					dim, dim);
-			glBindRenderbuffer(GL_RENDERBUFFER, 0);
-		}
-
-		glGenFramebuffers(1, &ma_gl_fbo[i]);
-		glBindFramebuffer(GL_FRAMEBUFFER, ma_gl_fbo[i]);
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-				GL_TEXTURE_2D, ma_gl_fbo_tex[i], 0);
-		if (depth)
-			glFramebufferRenderbuffer(GL_FRAMEBUFFER,
-					stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
-					GL_RENDERBUFFER, ma_gl_fbo_rb[i]);
-
-		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-			complete = 0;
-	}
-	ma_gl_fbo_valid = complete;
+	ma_gl_fbo_depth = depth;
+	ma_gl_fbo_stencil = stencil;
+	ma_gl_fbo_valid = ma_gl_create_slot(0, dim, depth, stencil);
 	ma_gl_fbo_dim_cur = dim;
+	// Fresh objects: drop any fence from the old slots (their names are gone),
+	// start the rotation over, and re-run the follow detector.
+	ma_gl_ring_reset();
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glBindTexture(GL_TEXTURE_2D, 0);
@@ -183,10 +412,14 @@ static bool ma_gl_create_fbo(int depth, int stencil) {
 
 	if (!ma_gl_fbo_valid)
 		LOG_error("minarch: hw-render FBO incomplete\n");
+	else
+		LOG_info("minarch: hw-render FBO ready (%ux%u, up to %u ring slots on demand)\n",
+				dim, dim, (unsigned)MA_GL_FBO_COUNT);
 	return ma_gl_fbo_valid;
 }
 
 static void ma_gl_destroy_fbo(void) {
+	ma_gl_ring_reset();
 	for (unsigned i = 0; i < MA_GL_FBO_COUNT; i++)
 	{
 		if (ma_gl_fbo[i]) glDeleteFramebuffers(1, &ma_gl_fbo[i]);
@@ -1021,14 +1254,13 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	// frame (the core reports its internal framebufferWidth -- e.g. the
 	// 853x480 startup estimate -- which is not the presented frame size).
 	static unsigned last_w = 0, last_h = 0;
-	// No index rotation: the core renders into the one FBO (glsm cached its
-	// id at SETUP) and the present samples that same FBO texture, so there is
-	// nothing to flip -- RA's gl2 flip at gl2.c:4163-4164 is a no-op for
-	// hw render (textures == 1) and gl3 has no index at all. On a dupe the
-	// texture simply still holds the previous frame, which is what we
-	// re-present.
+	// Ring: a new frame is published into the WRITE slot; the present samples
+	// that slot, then the ring advances so the core's next frame lands in a
+	// different slot.  A dupe publishes nothing, so it re-presents the slot
+	// the last real frame came from (see ma_gl_ring_publish/_after_present).
 	if (data == VALID) {
 		last_w = width; last_h = height;
+		ma_gl_ring_publish();
 	}
 	if (last_w) { width = last_w; height = last_h; }
 	// RA gl3.c:4773-4776: a zero reported size is fixed up to 1 so the
@@ -1038,10 +1270,11 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 
 	// RA video_driver_frame semantics: EVERY video_cb runs the driver frame,
 	// dupes included (video_driver.c: render_frame is only cleared by the
-	// fast-forward frameskip branch), so a dupe still presents -- the FBO
-	// simply still holds the previous frame, which is what re-presenting
-	// shows.  Measured dupe rate in play: 0 on both hw cores (flycast bursts
-	// them only while its render queue ramps up).
+	// fast-forward frameskip branch), so a dupe still presents.  It must also
+	// REDRAW, not just swap: with two window back buffers a bare swap flips to
+	// the buffer two presents old, which is the frame-timing flicker seen when
+	// the core sends dupes (frameskip on).  Redrawing re-fills both buffers
+	// with the same finished slot.
 	if (data == NULL) {
 		SDL_Window *dwin = PLAT_getGLWindow();
 		SDL_GLContext dctx = PLAT_getGLContext();
@@ -1049,6 +1282,8 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 		if (dwin && dctx) {
 			SDL_GL_MakeCurrent(dwin, dctx);
 			if (show_debug) GFX_frame_stats_display_only(core.fps);
+			if (ma_gl_present_w && ma_gl_present_h)
+				ma_gl_present_quad(ma_gl_present_w, ma_gl_present_h);
 			MA_present_frame();
 		}
 		// RA counts every video_cb, dupes included (video_driver.c:6011),
@@ -1099,6 +1334,9 @@ void MA_GL_video_refresh(const void *data, unsigned width, unsigned height, size
 	// divergence had no measured benefit to pay for it.
 	if (show_debug) GFX_frame_stats_display_only(core.fps);
 	MA_present_frame();
+	// The presented slot is now being read: fence it, then hand the core the
+	// next ring slot (see ma_gl_ring_after_present).
+	ma_gl_ring_after_present();
 	// Same counter as the software path's (PLAT_GL_Swap): every presented
 	// frame advances it, so FrameCount-driven shaders animate on hw cores too.
 	frame_count++;
