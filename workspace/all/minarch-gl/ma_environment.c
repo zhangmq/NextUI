@@ -35,6 +35,32 @@ static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uin
 	return 1;
 }
 
+/* RetroArch-private environment block (RA retroarch.h:45,53).  A threaded core
+ * (mupen64plus_next) asks for a callback it calls to release its blocking waits
+ * around state save/load.  RA answers with runloop_clear_all_thread_waits
+ * (start/stop its audio driver); the core stores the pointer and calls it
+ * UNCONDITIONALLY in retro_serialize/retro_unserialize
+ * (mupen64plus_next libretro.c:2151/2184).  Answering false leaves it NULL and
+ * every state save/load crashes the core with pc=0 (observed with SM64 EU and
+ * "Threaded Renderer" enabled).  So answer it. */
+#ifndef RETRO_ENVIRONMENT_RETROARCH_START_BLOCK
+#define RETRO_ENVIRONMENT_RETROARCH_START_BLOCK 0x800000
+#endif
+#ifndef RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB
+#define RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB (3 | RETRO_ENVIRONMENT_RETROARCH_START_BLOCK)
+#endif
+
+static bool ma_clear_all_thread_waits(unsigned clear_threads, void *data) {
+	(void)data;
+	/* Nothing to release on our side: hw-render cores run on the frontend's
+	 * thread and minarch's audio device is SDL-owned, so unlike RA there is no
+	 * frontend audio/thread state to start or stop.  Logged so the call is
+	 * visible in the per-core log. */
+	LOG_info("minarch: core clear-all-thread-waits -> %s\n",
+			clear_threads ? "clear" : "restore");
+	return true;
+}
+
 bool environment_callback(unsigned cmd, void *data) { // copied from picoarch initially
 	// LOG_info("environment_callback: %i\n", cmd);
 
@@ -45,6 +71,11 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 		// render unrotated and send SET_ROTATION(1)). Only the GLES hw-render
 		// path uses it; software cores (fbneo) output their own orientation.
 		MA_GL_set_rotation((unsigned)rotation);
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB: { /* 0x800003, RA private */
+		if (data) *(retro_environment_t *)data = ma_clear_all_thread_waits;
+		LOG_info("minarch: core asked for the clear-all-thread-waits callback -> provided\n");
 		break;
 	}
 	case RETRO_ENVIRONMENT_GET_OVERSCAN: { /* 2 */
