@@ -101,6 +101,11 @@ extern int show_menu;
  * the main loop in minarch.c. */
 extern int input_poll_type_override;
 extern int input_state_polled_this_frame;
+/* The d-pad/stick toggle hotkey: must run right after EVERY input poll, not
+ * only the core's poll_cb (a core asking for EARLY polling -- mupen with its
+ * threaded renderer on -- never calls poll_cb, so the frontend polls in the
+ * run loop and would otherwise never dispatch the hotkey). */
+void dpad_policy_hotkey(void);
 extern int newScreenshot;
 extern int fast_forward;
 extern int rewinding;

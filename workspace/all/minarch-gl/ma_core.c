@@ -132,7 +132,7 @@ static void dpad_policy_toggle(void) {
 // Runs right after the upstream poll callback (which owns the Shortcuts table
 // and the menu-open-on-MENU-release rule), so a MENU+button binding can still
 // cancel the menu it would otherwise open.
-static void dpad_policy_hotkey(void) {
+void dpad_policy_hotkey(void) {
 	ButtonMapping *m = &config.shortcuts[SHORTCUT_TOGGLE_DPAD];
 	if (!m->name || m->local < 0) return;                 // unbound
 	if (m->mod && !PAD_isPressed(BTN_MENU)) return;
