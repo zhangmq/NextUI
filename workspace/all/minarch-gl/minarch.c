@@ -283,10 +283,13 @@ int main(int argc , char* argv[]) {
 		 *            of the frame (core_input_state_callback), which is what
 		 *            the flag below is cleared for.
 		 * DONTCARE (0, the default) behaves as NORMAL, RA's own default.
-		 * Known interaction: the rewind-wait paths in run_frame poll by
-		 * themselves, so an override core would poll twice on those frames
-		 * (rewind engaged only); RA guards the same case with
-		 * RETRO_CORE_FLAG_INPUT_POLLED, which is the flag this mirrors. */
+		 * There are exactly three poll sites -- EARLY here, NORMAL and LATE in
+		 * ma_core.c -- and every one of them also dispatches the d-pad/stick
+		 * hotkey (dpad_policy_hotkey); nothing else in the tree calls PAD_poll.
+		 * (An older comment here claimed run_frame's rewind-wait paths poll by
+		 * themselves and could poll twice on an override core; the run loop no
+		 * longer has such paths, and the d-pad hotkey silently stopped firing
+		 * on the EARLY path until it was dispatched here too.) */
 		input_state_polled_this_frame = 0;
 		if (input_poll_type_override == 1) {
 			input_state_polled_this_frame = 1;
