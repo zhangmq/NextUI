@@ -106,6 +106,10 @@ extern int input_state_polled_this_frame;
  * threaded renderer on -- never calls poll_cb, so the frontend polls in the
  * run loop and would otherwise never dispatch the hotkey). */
 void dpad_policy_hotkey(void);
+/* Frontend-side hotkeys that are NOT part of the upstream Shortcuts dispatch
+ * (d-pad policy, disc swap).  Every input poll must call this -- the three poll
+ * sites are EARLY (minarch.c run loop) and NORMAL/LATE (ma_core.c). */
+void ma_poll_hotkeys(void);
 extern int newScreenshot;
 extern int fast_forward;
 extern int rewinding;
@@ -275,6 +279,10 @@ enum {
 	// minarch-gl: switch the d-pad between its own buttons and the analog
 	// stick (for SKUs with no analog stick).  See ma_core.c.
 	SHORTCUT_TOGGLE_DPAD,
+	// minarch-gl: multi-disc games (the frontend has no disc menu; these are
+	// the whole disc UI).  MENU+L1 / MENU+R1 by default.  See ma_core.c.
+	SHORTCUT_PREV_DISC,
+	SHORTCUT_NEXT_DISC,
 	// Trimui only
 	SHORTCUT_TOGGLE_TURBO_A,
 	SHORTCUT_TOGGLE_TURBO_B,

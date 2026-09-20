@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 #include <libgen.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "ma_internal.h"
 #include "ma_saves.h"
@@ -10,6 +11,7 @@
 #include "ma_cheats.h"
 #include "ma_core.h"
 #include "ma_gl.h"
+#include "notification.h"
 
 
 void Core_getName(char* in_name, char* out_name) {
@@ -127,6 +129,15 @@ static void dpad_policy_toggle(void) {
 		dpad_mode == DPAD_MODE_ADD_RIGHT ? "add-right" :
 		dpad_mode == DPAD_MODE_ADD_BOTH ? "add-both" :
 		dpad_mode == DPAD_MODE_ROUTE_LEFT ? "route-left" : "route-right");
+	/* on-screen hint: the policy has no menu entry of its own, so the OSD is
+	 * the only feedback the user gets. */
+	Notification_push(NOTIFICATION_SETTING,
+		dpad_mode == DPAD_MODE_OFF ? "D-Pad: normal" :
+		dpad_mode == DPAD_MODE_ADD_LEFT ? "D-Pad + Left Stick" :
+		dpad_mode == DPAD_MODE_ADD_RIGHT ? "D-Pad + Right Stick" :
+		dpad_mode == DPAD_MODE_ADD_BOTH ? "D-Pad + Both Sticks" :
+		dpad_mode == DPAD_MODE_ROUTE_LEFT ? "D-Pad -> Left Stick" : "D-Pad -> Right Stick",
+		NULL);
 }
 
 // Runs right after the upstream poll callback (which owns the Shortcuts table
@@ -139,6 +150,70 @@ void dpad_policy_hotkey(void) {
 	if (!PAD_justPressed(1 << m->local)) return;
 	dpad_policy_toggle();
 	if (m->mod) show_menu = 0;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Disc swapping for multi-disc games.
+ *
+ * minarch only *stores* the core's disk-control interface (ma_environment.c);
+ * nothing ever called it, so a game that asks for "disc 2" could not be
+ * satisfied.  These two shortcuts are the whole disc UI: Previous/Next Disc
+ * (MENU+L1 / MENU+R1 by default), driving the interface with RetroArch's
+ * sequence -- eject, set the index, close -- and reporting the result on the
+ * OSD, because the user has no other way to see which disc is in.
+ * ------------------------------------------------------------------------- */
+static void disc_notify(unsigned idx, unsigned num, int ok) {
+	char msg[64];
+	if (num == 0)
+		snprintf(msg, sizeof msg, "No discs");
+	else if (num == 1)
+		snprintf(msg, sizeof msg, "Single disc");
+	else
+		snprintf(msg, sizeof msg, "Disc %u/%u%s", idx + 1, num, ok ? "" : " (failed)");
+	Notification_push(NOTIFICATION_SETTING, msg, NULL);
+}
+
+static void disc_swap(int delta) {
+	if (!disk_control_ext.get_num_images || !disk_control_ext.set_image_index) {
+		Notification_push(NOTIFICATION_SETTING, "Disc control unavailable", NULL);
+		return;
+	}
+	unsigned num = disk_control_ext.get_num_images();
+	if (num < 2) { disc_notify(0, num, 1); return; }
+
+	unsigned idx = disk_control_ext.get_image_index ? disk_control_ext.get_image_index() : 0;
+	if (idx >= num) idx = 0;
+	/* wrap around: a 2-disc game is usually a single next/prev press */
+	unsigned tgt = (unsigned)(((int)idx + delta + (int)num) % (int)num);
+
+	if (disk_control_ext.set_eject_state) disk_control_ext.set_eject_state(true);
+	int ok = disk_control_ext.set_image_index(tgt);
+	if (disk_control_ext.set_eject_state) disk_control_ext.set_eject_state(false);
+
+	LOG_info("disc: swap %u -> %u of %u (%s)\n", idx, tgt, num, ok ? "ok" : "failed");
+	disc_notify(tgt, num, ok);
+}
+
+void disc_shortcut_hotkey(void) {
+	static const int ids[2]   = { SHORTCUT_PREV_DISC, SHORTCUT_NEXT_DISC };
+	static const int delta[2] = { -1, +1 };
+	for (int i = 0; i < 2; i++) {
+		ButtonMapping *m = &config.shortcuts[ids[i]];
+		if (!m->name || m->local < 0) continue;                 // unbound
+		if (m->mod && !PAD_isPressed(BTN_MENU)) continue;
+		if (!PAD_justPressed(1 << m->local)) continue;
+		disc_swap(delta[i]);
+		if (m->mod) show_menu = 0;
+	}
+}
+
+/* Called right after EVERY input poll: the upstream poll callback owns the
+ * Shortcuts table, but a core asking for EARLY polling (mupen with its threaded
+ * renderer on) never calls it, so the run loop polls instead -- both paths must
+ * dispatch these. */
+void ma_poll_hotkeys(void) {
+	dpad_policy_hotkey();
+	disc_shortcut_hotkey();
 }
 
 // The analog value the d-pad contributes (0 when this mode does not drive it).
@@ -170,7 +245,7 @@ void core_input_poll_callback(void) {
 	// frontend instead (the main loop / core_input_state_callback below).
 	if (input_poll_type_override == 0 || input_poll_type_override == 2)
 		input_poll_callback();
-	dpad_policy_hotkey();
+	ma_poll_hotkeys();
 }
 
 // LATE: RA polls on the core's first retro_input_state read of the frame
@@ -182,7 +257,7 @@ static int16_t core_input_state_callback(unsigned port, unsigned device,
 	if (input_poll_type_override == 3 && !input_state_polled_this_frame) {
 		input_state_polled_this_frame = 1;
 		input_poll_callback();
-		dpad_policy_hotkey();
+		ma_poll_hotkeys();
 	}
 
 	int mode = dpad_policy_mode();

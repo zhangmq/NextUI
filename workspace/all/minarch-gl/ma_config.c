@@ -1810,6 +1810,9 @@ struct Config config = {
 		// cfg (it writes only its own table).  Unbound by default; the mode itself
 		// defaults from NEXTUI_ANALOG_DPAD (see ma_core.c) and is per session.
 		[SHORTCUT_TOGGLE_DPAD]          = {"Toggle D-Pad Mode", -1, BTN_ID_NONE, 0},
+		// Multi-disc games: MENU+L1 / MENU+R1 by default (minarch has no disc menu).
+		[SHORTCUT_PREV_DISC]			= {"Previous Disc",		-1, BTN_ID_L1, 1},
+		[SHORTCUT_NEXT_DISC]			= {"Next Disc",			-1, BTN_ID_R1, 1},
 		// Trimui only
 		[SHORTCUT_TOGGLE_TURBO_A]		= {"Toggle Turbo A",	-1, BTN_ID_NONE, 0},
 		[SHORTCUT_TOGGLE_TURBO_B]		= {"Toggle Turbo B",	-1, BTN_ID_NONE, 0},

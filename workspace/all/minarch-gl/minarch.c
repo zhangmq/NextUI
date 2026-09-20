@@ -294,7 +294,7 @@ int main(int argc , char* argv[]) {
 		if (input_poll_type_override == 1) {
 			input_state_polled_this_frame = 1;
 			input_poll_callback();
-			dpad_policy_hotkey();
+			ma_poll_hotkeys();
 		}
 
 		run_frame();
