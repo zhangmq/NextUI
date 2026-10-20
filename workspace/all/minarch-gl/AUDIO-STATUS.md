@@ -83,6 +83,34 @@ Non-skipping cores are unaffected: our Saturn core (hw-render, frameskip off)
 measured 59.4 fps / 1 underrun in both builds, and a core that never registers
 62 never sees a call.
 
+## Diagnostic switches
+
+All off by default; when off they cost one `getenv` per process (cached in a
+static).  Logs land in the per-game log minarch is launched with
+(`$LOGS_PATH/<TAG>.txt`, e.g. `.userdata/h700/logs/<tag>.txt` under the
+device's measurement harness), so enable them by exporting in the pak's
+`launch.sh` or in the harness' launch wrapper, not by editing code.
+
+| switch | default | what it does | output |
+|---|---|---|---|
+| `MINARCH_AUDIO_STATUS_LOG=1` | off | reports what the core is being told, once every 5 s | `minarch: audio status 5s: N calls, active N, underrun-flag N, occupancy avg A min B max C, N new underrun periods` |
+| `MINARCH_VIDEO_PROFILE=1` | off | per-section timing, once every 5 s: whole loop vs `run_frame`, the software present path (convert+upload+draw+swap), the audio batch | `minarch: loop X ms avg (run_frame Y, rest Z)` / `sw present X ms avg (...)` / `audio batch X ms avg` |
+| `MINARCH_DUMP_AT=<n>` | off | writes the n-th software `video_cb` frame as PPM (same index the headless harness' `YAB_DUMP_AT` counts, so the two can be compared) | `/mnt/sdcard/mdump-<n>.ppm` (path is hard-coded) |
+| `MINARCH_SKIP_PRESENT=1` | off | returns before the software present path: no conversion, no upload, no draw, no swap -- measurement only | nothing; saves 1.2-1.4 ms/frame |
+| `MINARCH_FRAME_LOG=1` | off (pre-existing) | the 5 s frame histogram; this work adds the software counterpart of the hw line | `minarch: sw video_cb: N new, M dupe` |
+
+`MINARCH_AUDIO_UNDERRUN_LATCH=<frames>` (default 0) is **not** a diagnostic but
+a behaviour knob: it keeps reporting `underrun` for N frames after the driver
+actually ran dry, because a single-frame pulse is enough for a core that skips
+one frame but not for one that needs consecutive skips (Yabadabadoo caps them
+at "Frameskip Interval").  With it, Golden Axe went from 17.5 s to 7.9 s of
+silence per 75 s.
+
+The input-poll timing mentioned in the cost table was measured with a temporary
+patch to the upstream `all/minarch/ma_input.c`; that patch is **not** part of
+this work (the upstream directory stays untouched), so that line does not
+appear in normal builds.
+
 ## Per-frame cost of the frontend (measured, not inferred)
 
 `MINARCH_VIDEO_PROFILE=1` logs the pieces every 5 s.  On Golden Axe with
