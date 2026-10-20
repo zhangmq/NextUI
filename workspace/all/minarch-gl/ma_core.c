@@ -476,6 +476,10 @@ void Core_quit(void) {
 		core.unload_game();
 		core.deinit();
 		core.initialized = 0;
+		/* RA frees the audio buffer status callback on unload
+		 * (runloop.c:4224-4227): a later core must never inherit it. */
+		core.audio_buffer_status = NULL;
+		core.audio_underruns_last = 0;
 	}
 }
 void Core_close(void) {

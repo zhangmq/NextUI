@@ -64,6 +64,20 @@ struct Core {
 	size_t (*get_memory_size)(unsigned id);
 
 	retro_core_options_update_display_callback_t update_visibility_callback;
+
+	/* Latency bookkeeping for RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY
+	 * (63): what the core asked for, what we actually run, and the last
+	 * cumulative underrun count handed to the 62 callback. */
+	unsigned audio_latency_request_ms;
+	unsigned audio_latency_current_ms;
+	unsigned audio_underruns_last;
+
+	/* RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK (62): the core's
+	 * "how full is the audio buffer" hook, used for adaptive frameskip
+	 * (mgba, pcsx_rearmed, Yabadabadoo's frameskip=auto).  Called once per
+	 * frame from the main loop after core.run() with no audio lock held;
+	 * cleared by Core_quit() so a new core never inherits it. */
+	retro_audio_buffer_status_callback_t audio_buffer_status;
 };
 
 struct Game {
@@ -106,6 +120,13 @@ extern int input_state_polled_this_frame;
  * threaded renderer on -- never calls poll_cb, so the frontend polls in the
  * run loop and would otherwise never dispatch the hotkey). */
 void dpad_policy_hotkey(void);
+/* RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK (62): report the audio
+ * ring's occupancy to the core once per frame (main loop, after core.run(),
+ * no audio lock held).  No-op when the core never registered a callback. */
+void MA_Audio_buffer_status_tick(void);
+/* Software present path accounting for the 5 s telemetry line: video_cb calls
+ * that carried a frame vs. dupes (data == NULL).  Resets on read. */
+void MA_video_take_frame_stats(unsigned *new_frames, unsigned *dupes);
 /* Frontend-side hotkeys that are NOT part of the upstream Shortcuts dispatch
  * (d-pad policy, disc swap).  Every input poll must call this -- the three poll
  * sites are EARLY (minarch.c run loop) and NORMAL/LATE (ma_core.c). */

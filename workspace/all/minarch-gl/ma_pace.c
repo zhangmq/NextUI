@@ -178,6 +178,12 @@ void MA_telemetry_tick(void) {
 							nf, dp, (double)ds / (double)(nf + dp), (unsigned long long)dm);
 			}
 		}
+		{
+			unsigned sn = 0, sd = 0;
+			MA_video_take_frame_stats(&sn, &sd);
+			if (sn || sd)
+				LOG_info("minarch: sw video_cb: %u new, %u dupe\n", sn, sd);
+		}
 		memset(buckets, 0, sizeof(buckets));
 		frames = 0; sum_ms = 0.0; worst_ms = 0.0;
 		last_log_ms = now_ms;

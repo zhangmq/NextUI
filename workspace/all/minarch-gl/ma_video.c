@@ -742,7 +742,42 @@ static void convert_rgb565_to_rgba(const void* src, uint32_t* dst, unsigned widt
 	}
 }
 
+/* Software-path frame accounting for the telemetry line: how many video_cb
+ * calls carried new pixels vs. were dupes (data == NULL).  A core that skips
+ * rendering (Yabadabadoo frameskip, mgba frameskip) shows up here as dupes;
+ * the hw path has its own counters in ma_gl.c. */
+static unsigned sw_video_new = 0, sw_video_dupe = 0;
+
+void MA_video_take_frame_stats(unsigned *new_frames, unsigned *dupes) {
+	*new_frames = sw_video_new;
+	*dupes = sw_video_dupe;
+	sw_video_new = sw_video_dupe = 0;
+}
+
+/* Software present-path cost: conversion + texture upload + draw + swap, i.e.
+ * everything a headless harness does NOT do.  MINARCH_VIDEO_PROFILE=1 logs the
+ * average once every 5 s next to the loop/present telemetry. */
+static int swprof_on = -1;
+static uint64_t swprof_sum_ns = 0;
+static unsigned swprof_n = 0;
+static uint32_t swprof_last_ms = 0;
+static uint64_t swprof_now(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 void video_refresh_callback(const void* data, unsigned width, unsigned height, size_t pitch) {
+	/* Diagnostic: MINARCH_SKIP_PRESENT=1 returns before any conversion/upload/
+	 * draw, so the loop time with and without the frontend's video work can be
+	 * separated on the device. */
+	static int skip_present = -1;
+	if (skip_present < 0) {
+		const char *e = getenv("MINARCH_SKIP_PRESENT");
+		skip_present = (e && e[0] && e[0] != '0') ? 1 : 0;
+	}
+	if (skip_present) return;
+
 	// GLES hardware-render path: the core passes RETRO_HW_FRAME_BUFFER_VALID
 	// and the frame lives in the GL framebuffer, not in a pixel buffer.
 	if (MA_GL_is_active()) {
@@ -763,6 +798,8 @@ void video_refresh_callback(const void* data, unsigned width, unsigned height, s
 
 	// Early exit if quitting to avoid rendering stale frames
 	if (quit) return;
+
+	if (data) sw_video_new++; else sw_video_dupe++;
 
 	// Allocate RGBA buffer if needed
 	if (!rgbaData || rgbaDataSize != width * height) {
@@ -792,6 +829,36 @@ void video_refresh_callback(const void* data, unsigned width, unsigned height, s
 	}
 	pitch = width * sizeof(Uint32);
 
+	/* Diagnostic: MINARCH_DUMP_AT=<n> writes frame n (counted in video_cb
+	 * calls, the same index the headless harness' YAB_DUMP_AT uses) as PPM so
+	 * the two frontends can be proved to show the same scene. */
+	{
+		static int dump_at = -2;
+		static unsigned dump_n = 0;
+		if (dump_at == -2) {
+			const char *e = getenv("MINARCH_DUMP_AT");
+			dump_at = (e && e[0]) ? atoi(e) : -1;
+		}
+		if (dump_at >= 0 && (int)dump_n == dump_at) {
+			char path[128];
+			snprintf(path, sizeof(path), "/mnt/sdcard/mdump-%u.ppm", dump_n);
+			FILE *f = fopen(path, "wb");
+			if (f) {
+				fprintf(f, "P6\n%u %u\n255\n", width, height);
+				for (unsigned y = 0; y < height; y++) {
+					const uint32_t *row = (const uint32_t *)((const unsigned char *)rgbaData + (size_t)y * pitch);
+					for (unsigned x = 0; x < width; x++) {
+						uint32_t p = row[x];
+						fputc((p >> 16) & 0xff, f); fputc((p >> 8) & 0xff, f); fputc(p & 0xff, f);
+					}
+				}
+				fclose(f);
+				LOG_info("minarch: dumped %s (%ux%u)\n", path, width, height);
+			}
+		}
+		dump_n++;
+	}
+
 	// Set ambient lighting color (if enabled)
 	if (ambient_mode && !fast_forward && data) {
 		GFX_setAmbientColor(data, width, height, pitch, ambient_mode);
@@ -799,7 +866,25 @@ void video_refresh_callback(const void* data, unsigned width, unsigned height, s
 
 
 	// Render the frame
-	video_refresh_callback_main(data, width, height, pitch);
+	{
+		if (swprof_on < 0)
+			swprof_on = getenv("MINARCH_VIDEO_PROFILE") ? 1 : 0;
+		uint64_t t0 = swprof_on ? swprof_now() : 0;
+		video_refresh_callback_main(data, width, height, pitch);
+		if (swprof_on) {
+			uint64_t t1 = swprof_now();
+			swprof_sum_ns += t1 - t0;
+			swprof_n++;
+			uint32_t now_ms = (uint32_t)(t1 / 1000000ull);
+			if (!swprof_last_ms) swprof_last_ms = now_ms;
+			if (now_ms - swprof_last_ms >= 5000) {
+				LOG_info("minarch: sw present %.2f ms avg over %u frames (convert+upload+draw+swap)\n",
+						(double)swprof_sum_ns / 1e6 / (swprof_n ? swprof_n : 1), swprof_n);
+				fflush(stdout);
+				swprof_sum_ns = 0; swprof_n = 0; swprof_last_ms = now_ms;
+			}
+		}
+	}
 }
 
 void Video_cleanup(void) {

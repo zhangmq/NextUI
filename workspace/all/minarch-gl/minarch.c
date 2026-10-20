@@ -29,6 +29,16 @@ SDL_Surface* screen;
 int quit = 0;
 int newScreenshot = 0;
 int show_menu = 0;
+
+static int loopprof_on = -1;
+static uint64_t loopprof_run_ns, loopprof_rest_ns, loopprof_t0;
+static unsigned loopprof_n;
+static uint32_t loopprof_last_ms;
+static uint64_t loopprof_now(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 int simple_mode = 0;
 enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
 
@@ -297,7 +307,24 @@ int main(int argc , char* argv[]) {
 			ma_poll_hotkeys();
 		}
 
+		{
+			if (loopprof_on < 0) loopprof_on = getenv("MINARCH_VIDEO_PROFILE") ? 1 : 0;
+			loopprof_t0 = loopprof_on ? loopprof_now() : 0;
+		}
 		run_frame();
+		{
+			if (loopprof_on) {
+				uint64_t t = loopprof_now();
+				loopprof_run_ns += t - loopprof_t0;
+				loopprof_t0 = t;
+			}
+		}
+
+		/* RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK (62): report the
+		 * audio ring's occupancy to the core once per frame, after its
+		 * retro_run and before pacing -- RA does the same in core_run
+		 * (runloop.c:8029-8065).  No-op unless a core registered. */
+		MA_Audio_buffer_status_tick();
 
 		// Deferred auto-resume (see ma_saves.c): mupen64plus-next refuses a
 		// state load until its emulator thread has run once, so the startup
@@ -395,6 +422,23 @@ int main(int argc , char* argv[]) {
 		Audio_checkAndResetIfNeeded();
 
 		hdmimon();
+
+		if (loopprof_on) {
+			uint64_t t = loopprof_now();
+			loopprof_rest_ns += t - loopprof_t0;
+			loopprof_t0 = t;
+			loopprof_n++;
+			uint32_t now_ms = (uint32_t)(t / 1000000ull);
+			if (!loopprof_last_ms) loopprof_last_ms = now_ms;
+			if (now_ms - loopprof_last_ms >= 5000) {
+				LOG_info("minarch: loop %.2f ms avg (run_frame %.2f, rest %.2f) over %u frames\n",
+						(double)(loopprof_run_ns + loopprof_rest_ns) / 1e6 / (loopprof_n ? loopprof_n : 1),
+						(double)loopprof_run_ns / 1e6 / (loopprof_n ? loopprof_n : 1),
+						(double)loopprof_rest_ns / 1e6 / (loopprof_n ? loopprof_n : 1), loopprof_n);
+				fflush(stdout);
+				loopprof_run_ns = loopprof_rest_ns = 0; loopprof_n = 0; loopprof_last_ms = now_ms;
+			}
+		}
 	}
 	int cw, ch;
 	unsigned char* pixels = GFX_GL_screenCapture(&cw, &ch);
