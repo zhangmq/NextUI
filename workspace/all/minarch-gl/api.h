@@ -480,6 +480,19 @@ void SND_setBlockOnFull(int enable);
 void SND_quit(void);
 void SND_resetAudio(double sample_rate, double frame_rate);
 void SND_pauseAudio(bool paused);
+// Snapshot of the audio ring for RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_
+// CALLBACK (62), taken under the audio mutex and returned to the caller with
+// the lock released (never call a core from inside it).  Computed live from
+// frame_in/frame_out -- perf.buffer_free is only refreshed when the core
+// writes audio, so it goes stale during a starve.  total = usable slots
+// (the ring keeps one empty to tell full from empty), free = writable frames,
+// underruns = the driver's cumulative "silence for want of audio" count (the
+// same counter RA reports at teardown).  Returns 0 when there is no audio ring.
+int SND_getBufferStats(unsigned *total, unsigned *free_frames, unsigned *underruns);
+// RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY (63): record the ring size the
+// core asked for (0 = frontend default).  Takes effect in SND_init(), i.e. the
+// next SND_resetAudio() rebuild -- ask for it, then rebuild once.
+void SND_setLatencyTarget(unsigned ms);
 void SND_setQuality(int quality);
 
 // watch audio device changes

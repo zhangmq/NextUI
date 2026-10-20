@@ -309,16 +309,23 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 	}
 
 	case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE: {
-		// fixes fbneo save state graphics corruption
-		// puts("RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE");
+		/* RA runloop.c:3241-3266: VIDEO while the video driver is active,
+		 * AUDIO while the audio driver is not suspended.  minarch always
+		 * presents, so VIDEO is unconditional; AUDIO follows the exact
+		 * predicate the audio callbacks use (ma_audio.c): a fast-forward with
+		 * ff_audio off, or a rewind with rewind audio off, writes no samples,
+		 * and the core is then told not to produce them.  The old
+		 * unconditional VIDEO|AUDIO (a fbneo save-state graphics workaround)
+		 * kept cores producing audio nobody consumed. */
 		int *out_p = (int *)data;
 		if (out_p) {
-			int out = 0;
-			out |= RETRO_AV_ENABLE_VIDEO;
-			out |= RETRO_AV_ENABLE_AUDIO;
+			int audio_used = (!rewinding || rewind_ctx.audio)
+					&& (!fast_forward || ff_audio);
+			int out = RETRO_AV_ENABLE_VIDEO;
+			if (audio_used) out |= RETRO_AV_ENABLE_AUDIO;
 			*out_p = out;
 		}
-		break;
+		return true;
 	}
 
 	// RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS (42 | RETRO_ENVIRONMENT_EXPERIMENTAL)
@@ -386,35 +393,47 @@ bool environment_callback(unsigned cmd, void *data) { // copied from picoarch in
 		break;
 	}
 	// TODO: RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION 59
-	// TODO: used by mgba, (but only during frameskip?)
-	// case RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: { /* 62 */
-	// 	LOG_info("RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK\n");
-	// 	const struct retro_audio_buffer_status_callback *cb = (const struct retro_audio_buffer_status_callback *)data;
-	// 	if (cb) {
-	// 		LOG_info("has audo_buffer_status callback\n");
-	// 		core.audio_buffer_status = cb->callback;
-	// 	} else {
-	// 		LOG_info("no audo_buffer_status callback\n");
-	// 		core.audio_buffer_status = NULL;
-	// 	}
-	// 	break;
-	// }
-	// TODO: used by mgba, (but only during frameskip?)
-	// case RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY: { /* 63 */
-	// 	LOG_info("RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY\n");
-	//
-	// 	const unsigned *latency_ms = (const unsigned *)data;
-	// 	if (latency_ms) {
-	// 		unsigned frames = *latency_ms * core.fps / 1000;
-	// 		if (frames < 30)
-	// 			// audio_buffer_size_override = frames;
-	// 			LOG_info("audio_buffer_size_override = %i (unused?)\n", frames);
-	// 		else
-	// 			LOG_info("Audio buffer change out of range (%d), ignored\n", frames);
-	// 	}
-	// 	break;
-	// }
-
+	case RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: { /* 62 */
+		/* The core wants to know how full the audio ring is, once per frame,
+		 * so it can skip a frame while the frontend is starving for samples
+		 * (mgba, pcsx_rearmed, Yabadabadoo's frameskip=auto).  Store the
+		 * callback; MA_Audio_buffer_status_tick() (main loop, after
+		 * core.run()) does the reporting.  data == NULL (or a NULL callback
+		 * inside it) unregisters, and both must still answer true. */
+		const struct retro_audio_buffer_status_callback *cb =
+				(const struct retro_audio_buffer_status_callback *)data;
+		core.audio_buffer_status = cb ? cb->callback : NULL;
+		LOG_info("minarch: audio buffer status callback %s\n",
+				core.audio_buffer_status ? "registered" : "cleared");
+		return true;
+	}
+	case RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY: { /* 63 */
+		/* RA runloop.c:2556-2615: the value is a *minimum*; a request below
+		 * the frontend's current latency is a no-op and 0/NULL restores the
+		 * default.  It may make the frontend reinit its audio system -- ours
+		 * is the ring buffer, resized by SND_resetAudio() (the same path a
+		 * sink change takes, so there is only one rebuild path). */
+		unsigned req = data ? *(const unsigned *)data : 0;
+		unsigned applied = req;
+		if (applied > 512) {
+			LOG_info("minarch: minimum audio latency %u ms clamped to 512\n", req);
+			applied = 512;
+		}
+		/* The default ring is 8 frames of audio (api.c SND_init). */
+		double fps = core.fps > 0.0 ? core.fps : 60.0;
+		unsigned default_ms = (unsigned)(8000.0 / fps + 0.5);
+		unsigned target_ms = applied > default_ms ? applied : 0;
+		if (target_ms != core.audio_latency_current_ms) {
+			core.audio_latency_request_ms = req;
+			core.audio_latency_current_ms = target_ms;
+			SND_setLatencyTarget(target_ms);
+			LOG_info("minarch: minimum audio latency %u ms -> ring %s (%u ms default)\n",
+					req, target_ms ? "rebuilt for the requested latency" : "back to default",
+					default_ms);
+			SND_resetAudio(core.sample_rate, fps);
+		}
+		return true;
+	}
 	// TODO: RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE 64
 	case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE: { /* 65 */
 		// const struct retro_system_content_info_override* info = (const struct retro_system_content_info_override* )data;

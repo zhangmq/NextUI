@@ -195,6 +195,14 @@ static struct PWR_Context
 	SDL_atomic_t poll_network_status;
 } pwr = {0};
 
+/* RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY (63) target, in ms; 0 = the
+ * frontend default (the fixed "8 frames of audio" ring below).  Read by
+ * SND_init(), so the request is applied by the next SND_resetAudio() rebuild
+ * -- exactly the "frontend may have to reinit its audio system" the spec
+ * allows for.  Guarded by audio_mutex because ma_environment.c sets it from
+ * the core's thread and SND_init() reads it from the frontend thread. */
+static unsigned snd_latency_target_ms = 0;
+
 static struct SND_Context
 {
 	int initialized;
@@ -214,6 +222,7 @@ static struct SND_Context
 	unsigned samples;         // power-of-two sample count requested from SDL
 	unsigned underruns;       // RA-style "periods of silence for want of audio"
 	unsigned underrun_frames;
+	unsigned min_avail;       // lowest free-frame count since the last 62 tick
 
 	// When set, SND_batchSamples blocks (cond_wait) on a full ring buffer
 	// instead of dropping frames. Used by the hardware-render path to give
@@ -2687,6 +2696,20 @@ static void SND_audioCallback(void *userdata, uint8_t *stream, int len)
 		if (snd.frame_out >= snd.frame_count)
 			snd.frame_out = 0;
 	}
+	/* Low-water mark for RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK:
+	 * the consumer is where a starve is observable, so record the free-frame
+	 * low since the last status tick.  Sampling only in the main loop (right
+	 * after the core wrote its batch) reads the ring at its fullest, which
+	 * makes a starving core look fine every other frame. */
+	{
+		int count = (int)snd.frame_count;
+		if (count > 1)
+		{
+			int used = (snd.frame_in - snd.frame_out + count) % count;
+			unsigned avail = (unsigned)((count - 1) - used);
+			if (avail < snd.min_avail) snd.min_avail = avail;
+		}
+	}
 	pthread_cond_broadcast(&audio_cond);
 	pthread_mutex_unlock(&audio_mutex);
 
@@ -2725,6 +2748,7 @@ static void SND_resizeBuffer(void)
 
 	snd.frame_in = 0;
 	snd.frame_out = 0;
+	snd.min_avail = (unsigned)snd.frame_count;
 
 #if defined(USE_SDL2)
 	SDL_UnlockAudioDevice(snd.device_id);
@@ -3277,7 +3301,24 @@ void SND_init(double sample_rate, double frame_rate)
 
 	LOG_info("We now have audio device #%d\n", snd.device_id);
 
-	snd.frame_count = ((float)spec_out.freq / SCREEN_FPS) * 8; // buffer size based on sample rate out (times 12 samples headroom)
+	/* Ring size: default is 8 frames of audio (RA's default hw buffer is in
+	 * the same ballpark); a core that asked for a minimum latency via
+	 * RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY gets that many ms instead,
+	 * but never less than two frames (a smaller ring would underrun on the
+	 * first jitter).  Spec: values above the frontend default only. */
+	pthread_mutex_lock(&audio_mutex);
+	unsigned latency_target_ms = snd_latency_target_ms;
+	pthread_mutex_unlock(&audio_mutex);
+	if (latency_target_ms) {
+		unsigned frames = (unsigned)ceil((double)latency_target_ms * spec_out.freq / 1000.0);
+		unsigned floor_frames = (unsigned)((double)spec_out.freq / SCREEN_FPS * 2.0);
+		if (frames < floor_frames) frames = floor_frames;
+		snd.frame_count = frames;
+		LOG_info("audio ring sized for %u ms: %u frames\n", latency_target_ms, frames);
+	}
+	else {
+		snd.frame_count = ((float)spec_out.freq / SCREEN_FPS) * 8; // buffer size based on sample rate out (times 8 frames of headroom)
+	}
 	perf.buffer_size = snd.frame_count;
 	snd.sample_rate_in = sample_rate;
 	snd.sample_rate_out = spec_out.freq;
@@ -3332,6 +3373,49 @@ void SND_resetAudio(double sample_rate, double frame_rate)
 {
 	SND_quit();
 	SND_init(sample_rate, frame_rate);
+}
+
+void SND_setLatencyTarget(unsigned ms)
+{
+	pthread_mutex_lock(&audio_mutex);
+	snd_latency_target_ms = ms;
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+int SND_getBufferStats(unsigned *total, unsigned *free_frames, unsigned *underruns)
+{
+	int ok = 0;
+
+	pthread_mutex_lock(&audio_mutex);
+	if (snd.initialized && snd.frame_count > 1 && snd.buffer)
+	{
+		int count = (int)snd.frame_count;
+		int used = (snd.frame_in - snd.frame_out + count) % count;
+		/* One slot is always kept empty (that is how "full" is told from
+		 * "empty"), so the usable capacity is count-1. */
+		int usable = count - 1;
+		int free_n = usable - used;
+		if (free_n < 0) free_n = 0;
+		if (free_n > usable) free_n = usable;
+		/* Report the worst fill seen since the previous call (see
+		 * SND_audioCallback): a core deciding whether to skip a frame needs to
+		 * know the ring ran dry, not just how it looks right after the core
+		 * refilled it. */
+		if (free_n > (int)snd.min_avail) free_n = (int)snd.min_avail;
+		if (free_n < 0) free_n = 0;
+		snd.min_avail = (unsigned)(usable - used);
+		if (total) *total = (unsigned)usable;
+		if (free_frames) *free_frames = (unsigned)free_n;
+		ok = 1;
+	}
+	else
+	{
+		if (total) *total = 0;
+		if (free_frames) *free_frames = 0;
+	}
+	if (underruns) *underruns = snd.underruns;
+	pthread_mutex_unlock(&audio_mutex);
+	return ok;
 }
 
 void SND_pauseAudio(bool paused)
